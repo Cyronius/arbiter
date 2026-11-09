@@ -26,7 +26,9 @@ def codex_command(entry):
     argv = ["codex", "app-server", "--listen", "stdio://",
             "-c", f"mcp_servers.arbiter.command={json.dumps(sys.executable)}",
             "-c", f"mcp_servers.arbiter.args={json.dumps([str(entry), 'mcp'])}",
-            "-c", 'mcp_servers.arbiter.env_vars=["ARBITER_SESSION","ARBITER_URL","ARBITER_TOKEN"]']
+            "-c", 'mcp_servers.arbiter.env_vars=["ARBITER_SESSION","ARBITER_URL","ARBITER_TOKEN"]',
+            # reserve/checkpoint legitimately block until resources free up or work resumes.
+            "-c", "mcp_servers.arbiter.tool_timeout_sec=86400"]
     for tool in ROUTINE_TOOLS:
         argv += ["-c", f'mcp_servers.arbiter.tools.{tool}.approval_mode="approve"']
     return argv
@@ -40,8 +42,12 @@ class Transport:
         def read():
             for line in self.proc.stdout:
                 try:
-                    self.incoming.put(json.loads(line))
+                    value = json.loads(line)
                 except ValueError:
+                    value = None
+                if isinstance(value, dict):
+                    self.incoming.put(value)
+                else:
                     print(line.rstrip(), file=sys.stderr)
             self.incoming.put(None)
         threading.Thread(target=read, daemon=True).start()
@@ -194,11 +200,14 @@ class Claude:
 
 
 def run_agent(args):
-    client = Client()
+    client = Client(patient=60)
     cls = Codex if args.provider == "codex" else Claude
-    sid = client.action("register", name=args.name or args.provider, kind=args.provider, cwd=args.cwd,
-                        preemptible=True, capabilities=cls.capabilities)["id"]
-    env = dict(os.environ, ARBITER_SESSION=sid, ARBITER_URL=client.url, ARBITER_TOKEN=client.token)
+    registered = client.action("register", name=args.name or args.provider, kind=args.provider, cwd=args.cwd,
+                               preemptible=True, capabilities=cls.capabilities)
+    sid = registered["id"]
+    # The child gets a token scoped to its own session. It cannot answer approvals, pause or resume
+    # sessions, or read the event stream; the operator token stays in this supervisor.
+    env = dict(os.environ, ARBITER_SESSION=sid, ARBITER_URL=client.url, ARBITER_TOKEN=registered["token"])
     entry = Path(__file__).resolve().parent / "entry.py"
     print(f"Arbiter session: {sid}", file=sys.stderr, flush=True)
     adapter, failed = None, False

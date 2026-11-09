@@ -8,6 +8,8 @@ version = "0.1.0"
 description = "Local resource scheduling and communication for coding sessions"
 requires-python = ">=3.11"
 dependencies = []
+license = "MIT"
+license-files = ["LICENSE"]
 
 [project.scripts]
 arbiter = "arbiter.cli:main"
@@ -17,3 +19,11 @@ arbiter = ["static/*"]
 
 [tool.setuptools.packages.find]
 include = ["arbiter*"]
+
+[tool.ruff]
+line-length = 160
+target-version = "py311"
+
+[tool.ruff.lint]
+# Correctness checks only; the codebase deliberately keeps a compact style.
+select = ["E9", "F", "B006", "B008", "UP006"]

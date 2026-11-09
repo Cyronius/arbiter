@@ -19,6 +19,8 @@ def parser():
     s.add_argument("--cpu", type=float, help="Concurrent CPU scheduling budget (default: 80%% of logical CPUs)")
     s.add_argument("--memory-mb", type=int, help="Job memory budget in MiB (default: 70%% of RAM)")
     s.add_argument("--headroom-mb", type=int, default=512, help="Keep this much measured free memory (default: 512 MiB)")
+    s.add_argument("--retention-days", type=float, default=14, help="Forget sessions finished longer ago than this (0 keeps everything; default: 14)")
+    sub.add_parser("open", help="Open the browser board with a fresh one-time link")
     sub.add_parser("status", help="Print sessions, reservations and capacity")
     e = sub.add_parser("events", help="Read durable message-board events")
     e.add_argument("--after", type=int, default=0)
@@ -118,6 +120,12 @@ def main():
             from .workers import demo
             return demo(args.delay)
         client = Client()
+        if command == "open":
+            import webbrowser
+            link = client.request("/api/launch", {})["url"]
+            print(link)
+            webbrowser.open(link)
+            return
         if command == "status":
             return output(client.snapshot())
         if command == "approvals":

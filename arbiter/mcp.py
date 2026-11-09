@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import threading
+import time
 
 from .client import Client
 
@@ -45,13 +46,31 @@ def execute(client, sid, name, args):
     return result
 
 
+def reply(lock, message):
+    with lock:
+        print(json.dumps(message), flush=True)
+
+
+def call_tool(client, sid, request, lock):
+    """Run one tools/call. Reserve/checkpoint can block for a long time, so this runs off the read loop."""
+    p = request.get("params", {})
+    try:
+        value = execute(client, sid, p["name"], p.get("arguments", {}))
+        result = {"content": [{"type": "text", "text": json.dumps(value)}]}
+    except (RuntimeError, ValueError, TypeError, KeyError) as e:
+        result = {"content": [{"type": "text", "text": str(e)}], "isError": True}
+    reply(lock, {"jsonrpc": "2.0", "id": request["id"], "result": result})
+
+
 def run(name="external-session"):
-    client = Client()
+    client = Client(patient=60)
     sid = os.environ.get("ARBITER_SESSION")
     if not sid:
         sid = client.action("register", name=name, kind="external", cwd=os.getcwd(),
                             capabilities=["mcp", "cooperative-pause", "poll-inbox"])["id"]
     stop = threading.Event()
+    lock = threading.Lock()
+    calls = []
 
     def heartbeat():
         while not stop.wait(10):
@@ -66,6 +85,8 @@ def run(name="external-session"):
             request = None
             try:
                 request = json.loads(line)
+                if not isinstance(request, dict):
+                    raise ValueError("request must be a JSON object")
                 method = request.get("method")
                 if "id" not in request:
                     continue
@@ -80,18 +101,21 @@ def run(name="external-session"):
                                          "inputSchema": {"type": "object", "properties": props, "required": required, "additionalProperties": False}}
                                         for n, desc, props, required in TOOLS]}
                 elif method == "tools/call":
-                    p = request.get("params", {})
-                    try:
-                        value = execute(client, sid, p["name"], p.get("arguments", {}))
-                        result = {"content": [{"type": "text", "text": json.dumps(value)}]}
-                    except (RuntimeError, ValueError, TypeError, KeyError) as e:
-                        result = {"content": [{"type": "text", "text": str(e)}], "isError": True}
-                else:
-                    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32601, "message": "Method not found"}}), flush=True)
+                    thread = threading.Thread(target=call_tool, args=(client, sid, request, lock), daemon=True)
+                    thread.start()
+                    calls.append(thread)
+                    calls = [t for t in calls if t.is_alive()]
                     continue
-                print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+                else:
+                    reply(lock, {"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32601, "message": "Method not found"}})
+                    continue
+                reply(lock, {"jsonrpc": "2.0", "id": request["id"], "result": result})
             except (ValueError, TypeError, KeyError) as e:
-                print(json.dumps({"jsonrpc": "2.0", "id": request.get("id") if isinstance(request, dict) else None,
-                                  "error": {"code": -32600, "message": str(e)}}), flush=True)
+                reply(lock, {"jsonrpc": "2.0", "id": request.get("id") if isinstance(request, dict) else None,
+                             "error": {"code": -32600, "message": str(e)}})
+        # The client closed stdin; give in-flight quick calls a moment to answer, but never hang on a long wait.
+        deadline = time.monotonic() + 5
+        for thread in calls:
+            thread.join(max(0, deadline - time.monotonic()))
     finally:
         stop.set()

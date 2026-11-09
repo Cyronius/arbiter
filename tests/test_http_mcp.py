@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from arbiter.core import Store
-from arbiter.server import Handler
+from arbiter.server import Handler, Launcher
 from arbiter.mcp import execute
 
 
@@ -45,7 +45,7 @@ class LocalHTTPClient:
         return result
     def action(self,operation,**data):
         return self.request('/api/action',{"action":operation,"data":data})
-    def snapshot(self):return self.request('/api/state')
+    def snapshot(self,wait=None):return self.request('/api/state' if wait is None else f'/api/state?wait={wait}&timeout=1')
     def inbox(self,sid):return self.request('/api/inbox?session='+sid)
     def wait(self,sid,reservation=None):
         from arbiter.client import Client
@@ -56,7 +56,7 @@ class HTTPMCPTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory()
         self.store=Store(Path(self.tmp.name)/'state.db',cpu=2,memory_mb=1024)
-        self.server=SimpleNamespace(store=self.store,token='test-token',server_port=7483,unix=False,telemetry={},stopping=threading.Event())
+        self.server=SimpleNamespace(store=self.store,token='test-token',server_port=7483,unix=False,telemetry={},stopping=threading.Event(),launcher=Launcher())
         self.client=LocalHTTPClient(self.server)
     def tearDown(self):
         self.store.db.close();self.tmp.cleanup()
@@ -72,14 +72,72 @@ class HTTPMCPTests(unittest.TestCase):
         self.assertEqual(self.client.exchange('/api/events?after=oops')[0],400)
         self.assertEqual(self.client.exchange('/api/action',{'action':'tick','data':{}})[0],400)
         self.assertEqual(self.client.exchange('/missing')[0],404)
-    def test_board_assets_and_cookie(self):
-        code,head,body=self.client.exchange('/',token=None)
+    def test_board_requires_single_use_launch_secret_for_cookie(self):
+        self.assertEqual(self.client.exchange('/',token=None)[0],401)
+        self.assertEqual(self.client.exchange('/?k=guess',token=None)[0],401)
+        link=self.client.request('/api/launch',{})['url']
+        self.assertTrue(link.startswith('http://127.0.0.1:7483/?k='))
+        secret=link.split('?k=')[1]
+        code,head,body=self.client.exchange('/?k='+secret,token=None)
         self.assertEqual(code,200)
         self.assertIn(b'SameSite=Strict',head)
         self.assertIn(b'HttpOnly',head)
         self.assertIn(b'Message board',body)
         self.assertIn(b"script-src 'self'",head)
+        self.assertEqual(self.client.exchange('/?k='+secret,token=None)[0],401)
+        # An existing cookie keeps working without a new secret and is not reissued.
+        code,head,_=self.client.exchange('/',token=None,headers={'Cookie':'arbiter=test-token'})
+        self.assertEqual(code,200)
+        self.assertNotIn(b'Set-Cookie',head)
         self.assertEqual(self.client.exchange('/app.js',token=None)[0],200)
+    def test_launch_requires_operator_token(self):
+        a=self.session()
+        token=self.store.state['sessions'][a]['token']
+        self.assertEqual(self.client.exchange('/api/launch',{},token=token)[0],403)
+    def test_session_token_is_scoped_to_its_own_session(self):
+        a,b=self.session('a'),self.session('b')
+        ta=self.store.state['sessions'][a]['token']
+        act=lambda op,**d:self.client.exchange('/api/action',{'action':op,'data':d},token=ta)[0]
+        self.assertEqual(act('report',session=a,status='ok'),200)
+        self.assertEqual(act('report',session=b,status='impersonation'),403)
+        self.assertEqual(act('control',session=a,action='pause'),403)
+        self.assertEqual(act('register',name='clone'),403)
+        req=self.client.action('approval_request',session=a,method='x/y',params={})
+        self.assertEqual(act('approval_answer',session=a,approval=req['id'],response={'decision':'accept'}),403)
+        self.assertEqual(self.client.snapshot()['approvals'][req['id']]['state'],'pending')
+        self.assertEqual(self.client.exchange('/api/inbox?session='+a,token=ta)[0],200)
+        self.assertEqual(self.client.exchange('/api/inbox?session='+b,token=ta)[0],403)
+        self.assertEqual(self.client.exchange('/api/events',token=ta)[0],403)
+        self.assertEqual(self.client.exchange('/api/state',token=ta)[0],200)
+    def test_finished_session_token_is_rejected(self):
+        a=self.session()
+        token=self.store.state['sessions'][a]['token']
+        self.client.action('finish',session=a,safe=True)
+        self.assertEqual(self.client.exchange('/api/state',token=token)[0],401)
+    def test_unexpected_errors_return_json_500_not_a_dropped_connection(self):
+        a=self.session()
+        with patch.object(self.store,'apply',side_effect=RuntimeError('boom')),patch('sys.stderr',io.StringIO()):
+            code,_,raw=self.client.exchange('/api/action',{'action':'report','data':{'session':a,'status':'x'}})
+        self.assertEqual(code,500)
+        self.assertEqual(json.loads(raw),{'error':'internal error'})
+    def test_malformed_fields_are_client_errors(self):
+        for data in ({'name':'x','cwd':5},{'name':'x','capabilities':'no'},{'name':'x','capabilities':[1]}):
+            self.assertEqual(self.client.exchange('/api/action',{'action':'register','data':data})[0],400)
+        a=self.session()
+        self.assertEqual(self.client.exchange('/api/action',{'action':'approval_request','data':{'session':a,'method':'m','params':'str'}})[0],400)
+        self.assertEqual(self.client.exchange('/api/action',{'action':['x'],'data':{}})[0],400)
+    def test_state_long_poll_returns_on_new_event(self):
+        a=self.session()
+        cursor=self.client.snapshot()['cursor']
+        timer=threading.Timer(.2,lambda:self.client.action('report',session=a,status='wake'))
+        timer.start();start=time.monotonic()
+        state=self.client.snapshot(wait=cursor)
+        timer.join()
+        self.assertGreater(state['cursor'],cursor)
+        self.assertLess(time.monotonic()-start,.9)
+        start=time.monotonic()
+        self.client.snapshot(wait=state['cursor'])
+        self.assertGreaterEqual(time.monotonic()-start,.9)
     def test_cookie_auth(self):
         self.assertEqual(self.client.exchange('/api/state',token=None,headers={'Cookie':'arbiter=test-token'})[0],200)
     def test_mcp_resource_pause_resume_through_http(self):

@@ -1,4 +1,5 @@
 import concurrent.futures
+import json
 import tempfile
 import time
 import unittest
@@ -64,7 +65,7 @@ class CoreTests(unittest.TestCase):
         a, b = self.session(), self.session()
         ra = self.apply("reserve", a, exclusive=["device"])
         rb = self.apply("reserve", b, exclusive=["device"])
-        self.store.state["sessions"][a]["heartbeat"] = time.time() - 100
+        self.store.beats[a] -= 100
         self.store.apply("tick", {})
         state = self.store.snapshot()
         self.assertEqual(state["sessions"][a]["state"], "stale")
@@ -101,7 +102,7 @@ class CoreTests(unittest.TestCase):
         a, b = self.session(), self.session()
         self.apply("reserve", a, cpu=2)
         self.apply("reserve", b, cpu=1)
-        self.store.state["sessions"][b]["heartbeat"] = time.time() - 100
+        self.store.beats[b] -= 100
         self.store.apply("tick", {})
         self.apply("finish", a, safe=True)
         self.assertEqual(self.store.snapshot()["sessions"][b]["state"], "stale")
@@ -193,3 +194,61 @@ class CoreTests(unittest.TestCase):
         req=self.apply("approval_request", a, method="item/fileChange/requestApproval", params={"reason":"edit"})
         self.apply("approval_answer",a,approval=req["id"],response={"decision":"decline"})
         self.assertEqual(self.store.snapshot()["approvals"][req["id"]]["response"],{"decision":"decline"})
+
+    def test_heartbeat_is_not_persisted_but_revives_stale_sessions(self):
+        a = self.session()
+        cursor = self.store.cursor()
+        before = self.db_state()
+        self.apply("heartbeat", a)
+        self.assertEqual(self.store.cursor(), cursor)
+        self.assertEqual(self.db_state(), before)
+        self.store.beats[a] -= 100
+        self.store.apply("tick", {})
+        self.apply("heartbeat", a)
+        self.assertEqual(self.store.snapshot()["sessions"][a]["state"], "running")
+        self.assertGreater(self.store.cursor(), cursor)
+
+    def db_state(self):
+        return self.store.db.execute("SELECT body FROM state WHERE id=1").fetchone()[0]
+
+    def test_failed_action_restores_pressure_tracking(self):
+        self.store.available_mb, self.store.recovered_since = 500, 123.0
+        with self.assertRaises(ValueError):
+            self.store.apply("reserve", {"session": "nope"})
+        self.assertEqual((self.store.available_mb, self.store.recovered_since), (500, 123.0))
+
+    def test_prune_forgets_old_finished_sessions_and_keeps_cursor(self):
+        self.store.retention_days = 1
+        old, new = self.session("old"), self.session("new")
+        self.apply("reserve", old, cpu=1)
+        self.apply("message", old, text="hello")
+        self.apply("finish", old, safe=True)
+        self.apply("finish", new, safe=True)
+        self.store.state["sessions"][old]["ended"] = time.time() - 3 * 86400
+        cursor = self.store.cursor()
+        self.store.last_prune = -1e9
+        self.store.apply("tick", {})
+        state = self.store.snapshot()
+        self.assertNotIn(old, state["sessions"])
+        self.assertIn(new, state["sessions"])
+        self.assertEqual(state["reservations"], {})
+        self.assertEqual(state["messages"], {})
+        self.assertGreaterEqual(self.store.cursor(), cursor)
+        self.assertTrue(any(e["kind"] == "state.pruned" for e in self.store.events()))
+
+    def test_schema_version_is_recorded_and_newer_state_is_refused(self):
+        self.assertEqual(self.store.state["schema_version"], 1)
+        self.store.state["schema_version"] = 99
+        self.store.db.execute("INSERT OR REPLACE INTO state VALUES (1, ?)", (json.dumps(self.store.state),))
+        self.store.db.commit()
+        with self.assertRaisesRegex(RuntimeError, "newer Arbiter"):
+            Store(self.path)
+
+    def test_session_token_lookup(self):
+        a = self.session()
+        token = self.store.state["sessions"][a]["token"]
+        self.assertEqual(self.store.session_for_token(token), a)
+        self.assertIsNone(self.store.session_for_token("wrong"))
+        self.assertIsNone(self.store.session_for_token("é"))
+        self.apply("finish", a, safe=True)
+        self.assertIsNone(self.store.session_for_token(token))

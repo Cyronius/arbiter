@@ -7,19 +7,19 @@ Python 3.11+ on Linux. No runtime dependencies. Uses your existing Codex/Claude 
 ## Start
 
 ```bash
-cd ~/Projects/arbiter
+cd arbiter   # your clone of this repository
 ./bin/arbiter serve
 ```
 
-Open **http://127.0.0.1:7483**. In another terminal:
+`serve` prints a one-time link to the board. Open it once; your browser keeps an HttpOnly cookie after that. For a fresh link later (for example after restarting the daemon), run `arbiter open`. Plain `http://127.0.0.1:7483` is refused without the link or cookie, so other local users cannot obtain access just by visiting it. In another terminal:
 
 ```bash
 arbiter demo
-arbiter agent codex 'Inspect this project and report what you find' --cwd ~/Projects/arbiter
-arbiter agent claude 'Inspect this project and report what you find' --cwd ~/Projects/arbiter
+arbiter agent codex 'Inspect this project and report what you find' --cwd .
+arbiter agent claude 'Inspect this project and report what you find' --cwd .
 ```
 
-The source entry point is `bin/arbiter`; a symlink in `~/.local/bin/arbiter` makes the short command available. If needed, use the absolute entry point or add `~/.local/bin` to your PATH. A standard Python package installation also exposes `arbiter`.
+The source entry point is `bin/arbiter`; symlink it somewhere on your PATH (for example `ln -s "$PWD/bin/arbiter" ~/.local/bin/arbiter`) to get the short command. If needed, use the absolute entry point. A standard Python package installation also exposes `arbiter`.
 
 The demo uses no models. It exercises resource contention, an update request, direct messaging, a cooperative pause, automatic wakeup of a waiting worker, and reacquisition on resume. Demo sessions remain in the board's history; enable **Show finished** to see them.
 
@@ -85,7 +85,7 @@ Use Arbiter as a stdio MCP server. Configure this entry in that session's MCP se
 {
   "mcpServers": {
     "arbiter": {
-      "command": "/home/cyrus/Projects/arbiter/bin/arbiter",
+      "command": "/absolute/path/to/arbiter/bin/arbiter",
       "args": ["mcp", "--name", "my-session"]
     }
   }
@@ -96,7 +96,7 @@ For Codex the equivalent TOML is:
 
 ```toml
 [mcp_servers.arbiter]
-command = "/home/cyrus/Projects/arbiter/bin/arbiter"
+command = "/absolute/path/to/arbiter/bin/arbiter"
 args = ["mcp", "--name", "my-session"]
 ```
 
@@ -113,19 +113,22 @@ For manual integration, `register`, `reserve`, `heartbeat`, `report`, `inbox`, `
 - Requests are ordered by priority plus time waiting. Unrelated work can backfill temporarily; after 30 seconds a blocked head request protects its place against continued backfill.
 - Resource ownership is exclusive for named resources and additive for CPU/memory. Names are cooperative conventions: use the same canonical name across projects when a resource is shared.
 - Every grant/wait decision includes a reason. State and events commit together in SQLite WAL mode.
-- Heartbeats expire after 45 seconds. A stale session's granted reservations remain held. A restarted daemon marks live registrations stale; returning heartbeats reconcile them. No stale owner is silently replaced.
+- Heartbeats expire after 45 seconds (measured on a monotonic clock, so wall-clock changes cannot expire sessions). A stale session's granted reservations remain held. A restarted daemon marks live registrations stale; returning heartbeats reconcile them. Supervisors, wrappers and MCP servers retry for up to 60 seconds while the daemon is down, so a daemon restart does not kill them. No stale owner is silently replaced.
 - When measured memory falls below headroom, Arbiter asks one managed, preemptible memory holder to pause. It waits for a safe acknowledgment before releasing anything. After free memory stays above twice headroom for 15 seconds, automatically paused sessions are resumed and queued for reacquisition. Manual pauses require manual resume. Ordinary commands and external sessions are not automatically preempted.
 - Requests have deadlines. An overdue request becomes visibly unanswered; it does not imply success or release resources. Late acknowledgments remain possible.
-- This is cooperative admission, not a security boundary against other processes running as your OS user. It does not fence uncooperative filesystem/device access or force-stop workers. State history has no automatic retention policy yet.
+- This is cooperative admission, not a security boundary against other processes running as your OS user. It does not fence uncooperative filesystem/device access or force-stop workers. Sessions that finished more than 14 days ago are pruned along with their reservations, commands, approvals, messages and events (`--retention-days N`, `0` keeps everything).
 
 ## Local API and storage
 
-The daemon listens only on `127.0.0.1`. Browser writes require the same origin; API requests require a bearer token or the board's HttpOnly, SameSite cookie. The board sets its cookie when visited locally. Host checks reject DNS rebinding hosts. The local OS user is the trust boundary.
+The daemon listens only on `127.0.0.1`. Browser writes require the same origin; API requests require a bearer token or the board's HttpOnly, SameSite cookie. The cookie is issued only in exchange for a single-use launch secret (`arbiter serve` prints one; `arbiter open` mints another). Host checks reject DNS rebinding hosts.
 
-State is under `~/.local/state/arbiter` (directory mode 0700). `connection.json` (0600) contains the local address and API token. Override the directory with `ARBITER_STATE_DIR`, or use `ARBITER_URL` and `ARBITER_TOKEN` for clients. Do not commit connection files. A daemon lock prevents two schedulers from owning the same state directory.
+There are two kinds of credential. The **operator token** (in `connection.json`) can do everything. A **session token**, returned when a session registers, can only act on that one session: report, reserve, release, checkpoint, message, acknowledge, finish and raise approval requests. It cannot answer approvals, pause or resume sessions, register new sessions or read the event stream. Managed agents (`arbiter agent`) receive only their session token, so a model cannot approve its own permission prompts through the API. This is not a sandbox: a process running as your OS user can still read `connection.json`. For real isolation, run agents as a different OS user or inside a sandbox. The local OS user is otherwise the trust boundary.
+
+State is under `~/.local/state/arbiter` (directory mode 0700). `connection.json` (0600, created owner-only and removed on clean shutdown) contains the local address and operator token. Heartbeats are kept in memory and not written to disk; other state changes commit to SQLite in WAL mode with `synchronous=NORMAL`. The state blob carries a `schema_version`, and a daemon refuses to open state written by a newer version. Override the directory with `ARBITER_STATE_DIR`, or use `ARBITER_URL` and `ARBITER_TOKEN` for clients. Do not commit connection files. A daemon lock prevents two schedulers from owning the same state directory.
 
 - `GET /healthz`: liveness.
-- `GET /api/state`: sessions, reservations, commands, messages, approvals, capacity, telemetry, event cursor.
+- `GET /api/state`: sessions, reservations, commands, messages, approvals, capacity, telemetry, event cursor. Add `?wait=<cursor>&timeout=5` to block until a newer event exists (long poll; timeout is capped at 10 seconds).
+- `POST /api/launch`: operator only; returns a single-use board link.
 - `GET /api/events?after=N`: next 200 durable events.
 - `GET /events?after=N`: server-sent events; reconnect supports `Last-Event-ID`.
 - `GET /api/inbox?session=ID`: unacknowledged requests and messages.

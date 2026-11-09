@@ -26,7 +26,7 @@ def run_job(args):
     argv = args.argv[1:] if args.argv and args.argv[0] == "--" else args.argv
     if not argv:
         raise ValueError("provide a command after --")
-    client = Client()
+    client = Client(patient=60)
     sid = client.action("register", name=args.name, kind="job", cwd=os.getcwd(),
                         capabilities=["drain-current-command", "automatic-wakeup", "process-group-tracking"])["id"]
     print(f"Arbiter session: {sid}", file=sys.stderr, flush=True)
@@ -37,19 +37,27 @@ def run_job(args):
         if args.cpu or args.memory_mb or args.exclusive:
             r = client.action("reserve", session=sid, cpu=args.cpu, memory_mb=args.memory_mb,
                               exclusive=args.exclusive, priority=args.priority)
+            cursor = None
             while True:
                 client.action("heartbeat", session=sid)
-                s = client.snapshot()["sessions"][sid]
-                if s["state"] == "draining":
+                state = client.snapshot(wait=cursor)
+                cursor = state["cursor"]
+                if state["sessions"][sid]["state"] == "draining":
                     client.action("checkpoint", session=sid, safe=True, status="Paused before command launch")
-                state = client.snapshot()
+                    cursor = None
+                    continue
                 if state["sessions"][sid]["state"] == "running" and state["reservations"][r["id"]]["state"] == "granted":
                     break
-                time.sleep(.5)
         proc = subprocess.Popen(argv, start_new_session=True)
         stopped = False
-        client.action("report", session=sid, status="Running: " + " ".join(argv)[:1500], stopping_point="Current command and its children finish")
+        # Only the program name goes on the board: arguments often carry secrets.
+        client.action("report", session=sid, status=f"Running: {os.path.basename(argv[0])} ({len(argv) - 1} arguments)", stopping_point="Current command and its children finish")
+        last = 0
         while proc.poll() is None or group_alive(proc.pid):
+            time.sleep(.5)
+            if time.monotonic() - last < 2:
+                continue
+            last = time.monotonic()
             client.action("heartbeat", session=sid)
             for c in client.inbox(sid)["commands"]:
                 if c["action"] == "status":
@@ -57,7 +65,6 @@ def run_job(args):
                 elif c["action"] == "pause" and c["state"] == "pending":
                     client.action("delivered", session=sid, command=c["id"])
                     client.action("report", session=sid, status="Draining current command; no signal sent", stopping_point="Current command and its children finish")
-            time.sleep(.5)
         stopped = True
         code = proc.wait()
     except BaseException:
@@ -75,7 +82,8 @@ def run_job(args):
         else:
             print(f"Child processes remain. Reservations retained for {sid}.", file=sys.stderr)
     if code:
-        sys.exit(code)
+        # A negative code means the command died from a signal; report the shell convention 128+N.
+        sys.exit(code if code > 0 else 128 - code)
 
 
 def demo(delay=.4):

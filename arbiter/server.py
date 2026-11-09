@@ -5,8 +5,10 @@ import os
 import secrets
 import socket
 import socketserver
+import sys
 import threading
 import time
+import traceback
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -26,12 +28,39 @@ def system_memory():
         return {}
 
 
+# Everything a session-scoped token may do, and only to its own session.
+SESSION_ACTIONS = {"heartbeat", "report", "reserve", "release", "checkpoint", "delivered", "finish",
+                   "message", "ack_message", "approval_request"}
+
+
+class Launcher:
+    """Single-use secrets that exchange for the board's browser cookie."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.secrets = {}
+
+    def mint(self, ttl=300):
+        secret = secrets.token_urlsafe(16)
+        with self.lock:
+            now = time.monotonic()
+            self.secrets = {k: v for k, v in self.secrets.items() if v is None or v > now}
+            self.secrets[secret] = None if ttl is None else now + ttl
+        return secret
+
+    def consume(self, secret):
+        with self.lock:
+            expiry = self.secrets.pop(secret, False)
+        return expiry is not False and (expiry is None or expiry > time.monotonic())
+
+
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
     def __init__(self, address, store, token):
         self.store, self.token = store, token
+        self.launcher = Launcher()
         self.stopping = threading.Event()
         self.telemetry = system_memory()
         self.unix = isinstance(address, str)
@@ -41,7 +70,12 @@ class Server(ThreadingHTTPServer):
 
     def server_bind(self):
         if self.unix:
-            socketserver.TCPServer.server_bind(self)
+            # Create the socket owner-only from the start rather than chmod-ing it afterwards.
+            old = os.umask(0o177)
+            try:
+                socketserver.TCPServer.server_bind(self)
+            finally:
+                os.umask(old)
             self.server_name, self.server_port = "localhost", 0
         else:
             super().server_bind()
@@ -59,15 +93,22 @@ class Handler(BaseHTTPRequestHandler):
         port = self.server.server_port
         return self.headers.get("Host") in {f"127.0.0.1:{port}", f"localhost:{port}"}
 
-    def authorized(self):
+    def principal(self):
+        """Return "operator", a session ID (session-scoped token), or None."""
         bearer = self.headers.get("Authorization", "").removeprefix("Bearer ")
         cookies = SimpleCookie()
         try:
             cookies.load(self.headers.get("Cookie", ""))
         except Exception:
-            return False
+            cookies = SimpleCookie()
         cookie = cookies.get("arbiter")
-        return hmac.compare_digest(bearer, self.server.token) or bool(cookie and hmac.compare_digest(cookie.value, self.server.token))
+        if hmac.compare_digest(bearer.encode(), self.server.token.encode()) or (
+                cookie and hmac.compare_digest(cookie.value.encode(), self.server.token.encode())):
+            return "operator"
+        return self.server.store.session_for_token(bearer) if bearer else None
+
+    def authorized(self):
+        return self.principal() == "operator"
 
     def response(self, status, body, content_type="application/json", cookie=False):
         raw = json.dumps(body).encode() if content_type == "application/json" else body
@@ -85,11 +126,22 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def fail(self, error):
+        """Last-resort handler: log server-side, tell the client nothing but that it failed."""
+        traceback.print_exception(error, file=sys.stderr)
+        if not getattr(self, "streaming", False):
+            try:
+                self.response(500, {"error": "internal error"})
+            except OSError:
+                pass
+
     def do_GET(self):
         try:
             self.get()
         except (BrokenPipeError, ConnectionResetError):
             pass
+        except Exception as e:
+            self.fail(e)
 
     def get(self):
         if not self.valid_host():
@@ -101,18 +153,37 @@ class Handler(BaseHTTPRequestHandler):
         files = {"/": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "text/javascript"), "/style.css": ("style.css", "text/css")}
         if url.path in files:
             name, content_type = files[url.path]
-            return self.response(200, (Path(__file__).parent / "static" / name).read_bytes(), content_type, cookie=url.path == "/")
-        if not self.authorized():
+            fresh = False
+            if url.path == "/":
+                # The page and its auth cookie are only handed to someone who holds the launch
+                # secret (printed by `arbiter serve`, or minted by `arbiter open`) or the cookie.
+                fresh = self.server.launcher.consume(query.get("k", [""])[0])
+                if not fresh and not self.authorized():
+                    return self.response(401, {"error": "open the board with the URL printed by `arbiter serve`, or run `arbiter open`"})
+            return self.response(200, (Path(__file__).parent / "static" / name).read_bytes(), content_type, cookie=fresh)
+        who = self.principal()
+        if not who:
             return self.response(401, {"error": "authentication required"})
         if url.path == "/api/state":
+            if "wait" in query:
+                try:
+                    wait, timeout = int(query["wait"][0]), min(10.0, max(0.0, float(query.get("timeout", ["5"])[0])))
+                except ValueError:
+                    return self.response(400, {"error": "invalid wait parameters"})
+                self.server.store.wait_for_change(wait, timeout)
             state = self.server.store.snapshot()
             state["telemetry"] = self.server.telemetry
             return self.response(200, state)
         if url.path == "/api/inbox":
+            sid = query.get("session", [None])[0]
+            if who != "operator" and sid != who:
+                return self.response(403, {"error": "session tokens may only read their own inbox"})
             try:
-                return self.response(200, self.server.store.inbox(query.get("session", [None])[0]))
+                return self.response(200, self.server.store.inbox(sid))
             except ValueError as e:
                 return self.response(400, {"error": str(e)})
+        if who != "operator":
+            return self.response(403, {"error": "operator token required"})
         if url.path in {"/api/events", "/events"}:
             try:
                 cursor = max(0, int(query.get("after", ["0"])[0]), int(self.headers.get("Last-Event-ID", "0")))
@@ -126,6 +197,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             self.close_connection = True
+            self.streaming = True
             while not self.server.stopping.is_set():
                 events = self.server.store.events(cursor)
                 for event in events:
@@ -143,13 +215,22 @@ class Handler(BaseHTTPRequestHandler):
             self.post()
         except (BrokenPipeError, ConnectionResetError):
             pass
+        except Exception as e:
+            self.fail(e)
 
     def post(self):
         origin = self.headers.get("Origin")
         if not self.valid_host() or (origin and origin != "http://" + self.headers.get("Host", "")):
             return self.response(403, {"error": "cross-origin writes refused"})
-        if not self.authorized():
+        who = self.principal()
+        if not who:
             return self.response(401, {"error": "authentication required"})
+        if self.path == "/api/launch":
+            if who != "operator":
+                return self.response(403, {"error": "operator token required"})
+            if self.server.unix:
+                return self.response(400, {"error": "the board needs TCP mode; restart without --unix-socket"})
+            return self.response(200, {"url": f"http://127.0.0.1:{self.server.server_port}/?k={self.server.launcher.mint()}"})
         if self.path != "/api/action":
             return self.response(404, {"error": "not found"})
         try:
@@ -160,15 +241,31 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(d, dict) or not isinstance(d.get("data", {}), dict):
                 raise ValueError("expected JSON object with action and data")
             action = d.get("action")
-            if action in {"reconcile", "tick"}:
+            if not isinstance(action, str) or action in {"reconcile", "tick"}:
                 raise ValueError("internal action")
+            if who != "operator":
+                if action not in SESSION_ACTIONS:
+                    return self.response(403, {"error": "operator token required for this action"})
+                if d.get("data", {}).get("session") != who:
+                    return self.response(403, {"error": "session tokens may only act on their own session"})
             result = self.server.store.apply(action, d.get("data", {}))
             return self.response(200, result)
         except (ValueError, TypeError, KeyError) as e:
             return self.response(400, {"error": str(e)})
 
 
+def write_private(path, content):
+    """Create a file readable only by the owner from the first byte (no chmod-after-write window)."""
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(content)
+    tmp.replace(path)
+
+
 def serve(args):
+    if args.headroom_mb < 0:
+        raise ValueError("memory headroom must be nonnegative")
     directory = state_dir()
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(directory, 0o700)
@@ -179,21 +276,15 @@ def serve(args):
         raise RuntimeError("An Arbiter daemon already owns this state directory") from None
     memory = system_memory()
     store = Store(directory / "arbiter.sqlite3", args.cpu or max(1, (os.cpu_count() or 2) * .8),
-                  args.memory_mb or max(256, int(memory.get("total_mb", 8192) * .7)), headroom_mb=args.headroom_mb)
+                  args.memory_mb or max(256, int(memory.get("total_mb", 8192) * .7)), headroom_mb=args.headroom_mb,
+                  retention_days=args.retention_days or None)
     store.available_mb = memory.get("available_mb")
     token = secrets.token_urlsafe(32)
     address = str(Path(args.unix_socket).resolve()) if args.unix_socket else ("127.0.0.1", args.port)
-    if args.headroom_mb < 0:
-        raise ValueError("memory headroom must be nonnegative")
     server = Server(address, store, token)
-    if args.unix_socket:
-        os.chmod(address, 0o600)
     url = "unix://" + address if args.unix_socket else f"http://127.0.0.1:{server.server_port}"
     connection = directory / "connection.json"
-    tmp = directory / "connection.tmp"
-    tmp.write_text(json.dumps({"url": url, "token": token}))
-    os.chmod(tmp, 0o600)
-    tmp.replace(connection)
+    write_private(connection, json.dumps({"url": url, "token": token}))
 
     def monitor():
         while not server.stopping.wait(3):
@@ -203,6 +294,9 @@ def serve(args):
     monitor_thread = threading.Thread(target=monitor, daemon=True)
     monitor_thread.start()
     print(f"Arbiter listening at {url}", flush=True)
+    if not args.unix_socket:
+        print(f"Open the board (one-time link): {url}/?k={server.launcher.mint(ttl=None)}\n"
+              "Later, run `arbiter open` for a fresh link.", flush=True)
     try:
         server.serve_forever(poll_interval=.25)
     except KeyboardInterrupt:
@@ -215,4 +309,9 @@ def serve(args):
             store.db.close()
         if args.unix_socket:
             Path(address).unlink(missing_ok=True)
+        try:
+            if json.loads(connection.read_text()).get("token") == token:
+                connection.unlink()
+        except (OSError, ValueError):
+            pass
         lock.close()

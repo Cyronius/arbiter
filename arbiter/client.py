@@ -12,8 +12,15 @@ def state_dir():
     return Path(os.environ.get("ARBITER_STATE_DIR", str(Path.home() / ".local/state/arbiter")))
 
 
+class Unreachable(RuntimeError):
+    """The daemon refused the connection or its socket is gone; the request never arrived."""
+
+
 class Client:
-    def __init__(self, url=None, token=None):
+    def __init__(self, url=None, token=None, patient=0):
+        # `patient` is how many seconds to keep retrying while the daemon is down (e.g. restarting).
+        # Only refused connections are retried, so a request is never delivered twice.
+        self.patient = patient
         self.url = url or os.environ.get("ARBITER_URL")
         self.token = token or os.environ.get("ARBITER_TOKEN")
         if not self.url or not self.token:
@@ -26,10 +33,22 @@ class Client:
         # Do not send bearer credentials through environment-configured HTTP proxies.
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-    def request(self, path, body=None):
+    def request(self, path, body=None, timeout=10):
+        deadline = time.monotonic() + self.patient
+        delay = .5
+        while True:
+            try:
+                return self.request_once(path, body, timeout)
+            except Unreachable:
+                if time.monotonic() + delay > deadline:
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 2, 5)
+
+    def request_once(self, path, body, timeout):
         raw = json.dumps(body).encode() if body is not None else None
         if self.url.startswith("unix://"):
-            conn = UnixConnection(self.url.removeprefix("unix://"))
+            conn = UnixConnection(self.url.removeprefix("unix://"), timeout)
             try:
                 conn.request("POST" if raw is not None else "GET", path, body=raw,
                              headers={"Authorization": "Bearer " + self.token, "Content-Type": "application/json"})
@@ -38,6 +57,8 @@ class Client:
                 if response.status >= 400:
                     raise RuntimeError(value.get("error", response.reason))
                 return value
+            except (ConnectionRefusedError, FileNotFoundError) as e:
+                raise Unreachable(f"Cannot reach Arbiter Unix socket: {e}") from None
             except OSError as e:
                 raise RuntimeError(f"Cannot reach Arbiter Unix socket: {e}") from None
             finally:
@@ -45,7 +66,7 @@ class Client:
         req = urllib.request.Request(self.url + path, data=raw,
                                      headers={"Authorization": "Bearer " + self.token, "Content-Type": "application/json"})
         try:
-            with self.opener.open(req, timeout=10) as response:
+            with self.opener.open(req, timeout=timeout) as response:
                 return json.load(response)
         except urllib.error.HTTPError as e:
             try:
@@ -54,21 +75,28 @@ class Client:
                 message = str(e)
             raise RuntimeError(message) from None
         except urllib.error.URLError as e:
+            if isinstance(e.reason, (ConnectionRefusedError, FileNotFoundError)):
+                raise Unreachable(f"Cannot reach Arbiter at {self.url}: {e.reason}") from None
             raise RuntimeError(f"Cannot reach Arbiter at {self.url}: {e.reason}") from None
 
     def action(self, operation, **data):
         return self.request("/api/action", {"action": operation, "data": data})
 
-    def snapshot(self):
-        return self.request("/api/state")
+    def snapshot(self, wait=None):
+        """Read state. With `wait`=an event cursor, block (server-side, up to 5s) until something newer happens."""
+        if wait is None:
+            return self.request("/api/state")
+        return self.request(f"/api/state?wait={int(wait)}&timeout=5", timeout=15)
 
     def inbox(self, sid):
         return self.request("/api/inbox?session=" + sid)
 
     def wait(self, sid, reservation=None):
+        cursor = None
         while True:
             self.action("heartbeat", session=sid)
-            state = self.snapshot()
+            state = self.snapshot(wait=cursor)
+            cursor = state["cursor"]
             session = state["sessions"][sid]
             if session["state"] in {"finished", "failed"}:
                 raise RuntimeError("session ended while waiting")
@@ -85,12 +113,11 @@ class Client:
             if session["state"] == "running":
                 if not reservation or state["reservations"][reservation]["state"] == "granted":
                     return state
-            time.sleep(.5)
 
 
 class UnixConnection(http.client.HTTPConnection):
-    def __init__(self, path):
-        super().__init__("localhost", timeout=10)
+    def __init__(self, path, timeout=10):
+        super().__init__("localhost", timeout=timeout)
         self.path = path
 
     def connect(self):
