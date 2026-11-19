@@ -11,7 +11,7 @@ cd arbiter   # your clone of this repository
 ./bin/arbiter serve
 ```
 
-`serve` prints a one-time link to the board. Open it once; your browser keeps an HttpOnly cookie after that. For a fresh link later (for example after restarting the daemon), run `arbiter open`. Plain `http://127.0.0.1:7483` is refused without the link or cookie, so other local users cannot obtain access just by visiting it. In another terminal:
+Open [the board](http://127.0.0.1:7483/) and sign in with the Linux account that runs Arbiter. On Omarchy, Arbiter verifies the password through Linux PAM. The browser keeps an HttpOnly session cookie. `arbiter open` also opens the board using a one-time link. In another terminal:
 
 ```bash
 arbiter demo
@@ -120,7 +120,7 @@ For manual integration, `register`, `reserve`, `heartbeat`, `report`, `inbox`, `
 
 ## Local API and storage
 
-The daemon listens only on `127.0.0.1`. Browser writes require the same origin; API requests require a bearer token or the board's HttpOnly, SameSite cookie. The cookie is issued only in exchange for a single-use launch secret (`arbiter serve` prints one; `arbiter open` mints another). Host checks reject DNS rebinding hosts.
+The daemon listens only on `127.0.0.1`. Browser writes require the same origin; API requests require a bearer token or the board's HttpOnly, SameSite cookie. The cookie is issued after a successful, rate-limited Linux PAM sign-in or a single-use launch secret (`arbiter serve` prints one and `arbiter open` mints another). Host checks reject DNS rebinding hosts.
 
 There are two kinds of credential. The **operator token** (in `connection.json`) can do everything. A **session token**, returned when a session registers, can only act on that one session: report, reserve, release, checkpoint, message, acknowledge, finish and raise approval requests. It cannot answer approvals, pause or resume sessions, register new sessions or read the event stream. Managed agents (`arbiter agent`) receive only their session token, so a model cannot approve its own permission prompts through the API. This is not a sandbox: a process running as your OS user can still read `connection.json`. For real isolation, run agents as a different OS user or inside a sandbox. The local OS user is otherwise the trust boundary.
 

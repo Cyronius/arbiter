@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import urlencode
 
 from arbiter.core import Store
 from arbiter.server import Handler, Launcher
@@ -28,7 +29,7 @@ class LocalHTTPClient:
     def __init__(self, server):
         self.server=server
     def exchange(self,path,body=None,token="test-token",headers=None):
-        raw=json.dumps(body).encode() if body is not None else b""
+        raw=body if isinstance(body, bytes) else json.dumps(body).encode() if body is not None else b""
         h={"Host":"127.0.0.1:7483", "Connection":"close", "Content-Length":str(len(raw))}
         if token: h["Authorization"]="Bearer "+token
         h.update(headers or {})
@@ -94,6 +95,25 @@ class HTTPMCPTests(unittest.TestCase):
         a=self.session()
         token=self.store.state['sessions'][a]['token']
         self.assertEqual(self.client.exchange('/api/launch',{},token=token)[0],403)
+    def test_linux_browser_sign_in(self):
+        self.server.login_lock = threading.Lock()
+        self.server.next_login = 0
+        headers = {"Origin": "http://127.0.0.1:7483", "Content-Type": "application/x-www-form-urlencoded"}
+        body = urlencode({"username": "owner", "password": "example +&"}).encode()
+        self.assertIn(b'action="/login"', self.client.exchange('/', token=None)[2])
+        with patch("arbiter.server.pam.authenticate", side_effect=[False, True]) as authenticate:
+            self.assertEqual(self.client.exchange('/login', body, token=None)[0], 403)
+            code, head, _ = self.client.exchange('/login', body, token=None, headers=headers)
+            self.assertEqual(code, 401)
+            self.assertNotIn(b"Set-Cookie", head)
+            self.assertEqual(self.client.exchange('/login', body, token=None, headers=headers)[0], 429)
+            authenticate.assert_called_once_with("owner", "example +&")
+            self.server.next_login = 0
+            code, head, _ = self.client.exchange('/login', body, token=None, headers=headers)
+        self.assertEqual(code, 303)
+        self.assertIn(b"Location: /", head)
+        self.assertIn(b"arbiter=test-token; HttpOnly; SameSite=Strict", head)
+        self.assertEqual(self.client.exchange('/', token=None, headers={'Cookie': 'arbiter=test-token'})[0], 200)
     def test_session_token_is_scoped_to_its_own_session(self):
         a,b=self.session('a'),self.session('b')
         ta=self.store.state['sessions'][a]['token']

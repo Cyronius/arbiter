@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from . import pam
 from .client import state_dir
 from .core import Store
 
@@ -61,6 +62,8 @@ class Server(ThreadingHTTPServer):
     def __init__(self, address, store, token):
         self.store, self.token = store, token
         self.launcher = Launcher()
+        self.login_lock = threading.Lock()
+        self.next_login = 0
         self.stopping = threading.Event()
         self.telemetry = system_memory()
         self.unix = isinstance(address, str)
@@ -110,7 +113,7 @@ class Handler(BaseHTTPRequestHandler):
     def authorized(self):
         return self.principal() == "operator"
 
-    def response(self, status, body, content_type="application/json", cookie=False):
+    def response(self, status, body, content_type="application/json", cookie=False, location=None):
         raw = json.dumps(body).encode() if content_type == "application/json" else body
         self.send_response(status)
         self.send_header("Content-Type", content_type)
@@ -123,6 +126,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
         if cookie:
             self.send_header("Set-Cookie", f"arbiter={self.server.token}; HttpOnly; SameSite=Strict; Path=/")
+        if location:
+            self.send_header("Location", location)
         self.end_headers()
         self.wfile.write(raw)
 
@@ -155,11 +160,11 @@ class Handler(BaseHTTPRequestHandler):
             name, content_type = files[url.path]
             fresh = False
             if url.path == "/":
-                # The page and its auth cookie are only handed to someone who holds the launch
-                # secret (printed by `arbiter serve`, or minted by `arbiter open`) or the cookie.
                 fresh = self.server.launcher.consume(query.get("k", [""])[0])
                 if not fresh and not self.authorized():
-                    return self.response(401, {"error": "open the board with the URL printed by `arbiter serve`, or run `arbiter open`"})
+                    if self.server.unix:
+                        return self.response(401, {"error": "the board needs TCP mode"})
+                    return self.login_page(401)
             return self.response(200, (Path(__file__).parent / "static" / name).read_bytes(), content_type, cookie=fresh)
         who = self.principal()
         if not who:
@@ -222,6 +227,10 @@ class Handler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin")
         if not self.valid_host() or (origin and origin != "http://" + self.headers.get("Host", "")):
             return self.response(403, {"error": "cross-origin writes refused"})
+        if self.path == "/login":
+            if self.server.unix or not origin:
+                return self.response(403, {"error": "sign-in requires a same-origin browser request"})
+            return self.login()
         who = self.principal()
         if not who:
             return self.response(401, {"error": "authentication required"})
@@ -252,6 +261,45 @@ class Handler(BaseHTTPRequestHandler):
             return self.response(200, result)
         except (ValueError, TypeError, KeyError) as e:
             return self.response(400, {"error": str(e)})
+
+
+    def login_page(self, status, message=""):
+        page = (Path(__file__).parent / "static" / "login.html").read_bytes()
+        return self.response(status, page.replace(b"<!-- feedback -->", message.encode()), "text/html; charset=utf-8")
+
+    def login(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if self.headers.get_content_type() != "application/x-www-form-urlencoded" or not 0 < length <= 8192:
+                raise ValueError
+            fields = parse_qs(self.rfile.read(length).decode("ascii"), strict_parsing=True,
+                              errors="strict", max_num_fields=2)
+            username, = fields["username"]
+            password, = fields["password"]
+        except (ValueError, KeyError):
+            return self.login_page(400, "Enter your Linux username and password.")
+
+        if not self.server.login_lock.acquire(blocking=False):
+            return self.login_page(429, "A sign-in attempt is in progress. Try again shortly.")
+        try:
+            status, message = self.verify_login(username, password)
+        finally:
+            self.server.login_lock.release()
+        if status == 303:
+            return self.response(status, b"", "text/html", cookie=True, location="/")
+        return self.login_page(status, message)
+
+    def verify_login(self, username, password):
+        if time.monotonic() < self.server.next_login:
+            return 429, "Wait five seconds between sign-in attempts."
+        try:
+            if pam.authenticate(username, password):
+                return 303, ""
+            return 401, "Sign-in failed. Check your Linux username and password."
+        except OSError:
+            return 503, "Linux sign-in is unavailable on this machine."
+        finally:
+            self.server.next_login = time.monotonic() + 5
 
 
 def write_private(path, content):
@@ -295,8 +343,8 @@ def serve(args):
     monitor_thread.start()
     print(f"Arbiter listening at {url}", flush=True)
     if not args.unix_socket:
-        print(f"Open the board (one-time link): {url}/?k={server.launcher.mint(ttl=None)}\n"
-              "Later, run `arbiter open` for a fresh link.", flush=True)
+        print(f"Sign in to the board at {url}/\n"
+              f"One-time launch link: {url}/?k={server.launcher.mint(ttl=None)}", flush=True)
     try:
         server.serve_forever(poll_interval=.25)
     except KeyboardInterrupt:
