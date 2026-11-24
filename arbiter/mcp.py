@@ -5,14 +5,16 @@ import sys
 import threading
 import time
 
+from . import identity
 from .client import Client
+from .config import phase_guidance
 
 
 TOOLS = [
     ("arbiter_report", "Report current activity, progress, blocker and next stopping point; answer a status command by ID.",
      {"status": {"type": "string"}, "progress": {"type": "string"}, "blocker": {"type": "string"}, "stopping_point": {"type": "string"}, "command": {"type": "string"}}, ["status"]),
-    ("arbiter_reserve", "Request one atomic resource bundle. Waits without model polling until granted. CPU is a scheduling weight; memory is MiB. Reserve before starting heavy work. Release any existing bundle first.",
-     {"cpu": {"type": "number"}, "memory_mb": {"type": "number"}, "exclusive": {"type": "array", "items": {"type": "string"}}, "priority": {"type": "number"}}, []),
+    ("arbiter_reserve", "Request one atomic resource bundle. Waits without model polling until granted. CPU is a scheduling weight; memory is MiB. Reserve one checkpoint at a time, using the preferred reservation length when practical. Set eta in seconds and release before queueing the next phase.",
+     {"cpu": {"type": "number"}, "memory_mb": {"type": "number"}, "exclusive": {"type": "array", "items": {"type": "string"}}, "priority": {"type": "number"}, "eta": {"type": "number", "description": "Expected seconds from grant to release"}}, []),
     ("arbiter_release", "Release a reservation only after work using it has stopped.", {"reservation": {"type": "string"}}, ["reservation"]),
     ("arbiter_inbox", "Read pending pause/status requests and messages. Check between work units.", {}, []),
     ("arbiter_checkpoint", "Acknowledge a requested pause at a safe stopping point. Confirm all resource-using child work has stopped. Releases reservations, blocks until resumed and reacquires the bundle before returning. Process RAM is not freed by this operation; declare only job memory that was actually released.",
@@ -64,9 +66,10 @@ def call_tool(client, sid, request, lock):
 
 def run(name="external-session"):
     client = Client(patient=60)
-    sid = os.environ.get("ARBITER_SESSION")
+    # A managed child, or an existing Claude Code/Codex conversation (the same session its hooks use).
+    sid = identity.current(client)
     if not sid:
-        sid = client.action("register", name=name, kind="external", cwd=os.getcwd(),
+        sid = client.action("register", name=name, kind="external", cwd=os.getcwd(), pid=os.getpid(),
                             capabilities=["mcp", "cooperative-pause", "poll-inbox"])["id"]
     stop = threading.Event()
     lock = threading.Lock()
@@ -91,9 +94,10 @@ def run(name="external-session"):
                 if "id" not in request:
                     continue
                 if method == "initialize":
+                    minutes = client.snapshot().get("settings", {}).get("preferred_phase_minutes", 10)
                     result = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
                               "serverInfo": {"name": "arbiter", "version": "0.1.0"},
-                              "instructions": f"Your Arbiter session ID is {sid}. Check arbiter_inbox between work units. Report starts, meaningful progress and finishes. Honor cooperative pauses at safe boundaries; never claim a pause while child work is running."}
+                              "instructions": f"Your Arbiter session ID is {sid}. {phase_guidance(minutes)} Check arbiter_inbox between work units. Report starts, meaningful progress and finishes. Honor cooperative pauses at safe boundaries; never claim a pause while child work is running."}
                 elif method == "ping":
                     result = {}
                 elif method == "tools/list":

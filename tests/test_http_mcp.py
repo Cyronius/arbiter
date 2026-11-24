@@ -1,6 +1,7 @@
 """Exercise the real HTTP parser/handlers using byte streams, without opening sockets."""
 import io
 import json
+import sys
 import tempfile
 import threading
 import time
@@ -57,12 +58,148 @@ class HTTPMCPTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory()
         self.store=Store(Path(self.tmp.name)/'state.db',cpu=2,memory_mb=1024)
-        self.server=SimpleNamespace(store=self.store,token='test-token',server_port=7483,unix=False,telemetry={},stopping=threading.Event(),launcher=Launcher())
+        self.server=SimpleNamespace(store=self.store,token='test-token',server_port=7483,unix=False,telemetry={},context_samples={},stopping=threading.Event(),launcher=Launcher())
         self.client=LocalHTTPClient(self.server)
     def tearDown(self):
         self.store.db.close();self.tmp.cleanup()
     def session(self,name='worker'):
         return self.client.action('register',name=name)['id']
+
+    def test_context_reading_reaches_board_and_cli_for_active_session(self):
+        from arbiter.server import refresh_context
+        from arbiter.workers import status_text
+        from tests.test_transcripts import CONVERSATION
+
+        sid = self.client.action("register", kind="claude", name="writer", provider="claude", external_id=CONVERSATION)["id"]
+        directory = Path(self.tmp.name) / "projects" / "writer"
+        directory.mkdir(parents=True)
+        record = {"type": "assistant", "message": {"usage": {"input_tokens": 12345}}}
+        (directory / f"{CONVERSATION}.jsonl").write_text(json.dumps(record) + "\n")
+        with patch.dict("os.environ", CLAUDE_CONFIG_DIR=self.tmp.name):
+            refresh_context(self.server)
+        state = self.client.snapshot()
+        self.assertEqual(state["sessions"][sid]["context_usage"], {"input_tokens": 12345})
+        self.assertIn("Context (last input): 12,345 tokens", status_text(state))
+        self.client.action("finish", session=sid, safe=True)
+        self.assertNotIn("context_usage", self.client.snapshot()["sessions"][sid])
+
+    def test_operator_moves_waiters_to_the_front(self):
+        from contextlib import redirect_stdout
+        from arbiter.cli import main
+
+        owner = self.session("owner")
+        holder = self.client.action("reserve", session=owner, exclusive=["gpu"])
+        waiters = [self.client.action("reserve", session=self.session(name), exclusive=["gpu"], priority=priority)
+                   for name, priority in (("urgent", 100), ("first pick", -100), ("second pick", -100))]
+        urgent, first, second = [r["id"] for r in waiters]
+        request = {"action": "promote", "data": {"reservation": first}}
+        token = self.store.state["sessions"][owner]["token"]
+        self.assertEqual(self.client.exchange("/api/action", request, token=token)[0], 403)
+        code, _, raw = self.client.exchange("/api/state", token=token)
+        self.assertEqual(code, 200)
+        scoped = json.loads(raw)
+        self.assertNotIn("instructions", scoped["settings"])
+        self.assertNotIn("presets", scoped["settings"])
+        self.assertNotIn("instructions", scoped["operator"])
+        self.assertEqual(self.client.exchange("/api/action", {"action": "promote", "data": {"reservation": holder["id"]}})[0], 400)
+        self.client.request("/api/action", request)
+        self.client.url = "http://127.0.0.1:8001"
+        output = io.StringIO()
+        with patch("arbiter.cli.Client", return_value=self.client), redirect_stdout(output):
+            main(["promote", second])
+            main([])
+        status = output.getvalue()
+        self.assertIn("Board: http://127.0.0.1:8001/", status)
+        self.assertIn(f"1. {second}", status)
+        self.assertIn(f"2. {first}", status)
+        self.assertIn(f"3. {urgent}", status)
+        self.client.action("release", session=owner, reservation=holder["id"])
+        reservations = self.client.snapshot()["reservations"]
+        self.assertEqual(reservations[second]["state"], "granted")
+        self.assertEqual(reservations[first]["queue_position"], 1)
+        self.assertEqual(reservations[urgent]["queue_position"], 2)
+
+    def test_second_serve_prints_the_daemons_recorded_address(self):
+        import fcntl
+        from contextlib import redirect_stdout
+        from arbiter.cli import main
+
+        directory = Path(self.tmp.name)
+        with (directory / "daemon.lock").open("w") as lock, patch("arbiter.server.state_dir", return_value=directory):
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            for url in ("http://127.0.0.1:8111", "unix:///tmp/test-arbiter.sock"):
+                (directory / "connection.json").write_text(json.dumps({"url": url, "token": "private-test-token"}))
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    main(["serve"])
+                self.assertIn(url, output.getvalue())
+                self.assertNotIn("private-test-token", output.getvalue())
+
+    def test_operator_settings_are_scoped_durable_and_can_follow_config_again(self):
+        original = self.client.snapshot()["settings"]
+        fields = {k: original[k] for k in ("provider", "model", "approve_inbox", "manage_resources", "preferred_phase_minutes")}
+        fields.update(provider="pi", model="test-model", manage_resources=True, preferred_phase_minutes=30)
+        request = {"action": "save_settings", "data": {"expected": original, "settings": fields}}
+        token = self.store.state["sessions"][self.session()]["token"]
+        self.assertEqual(self.client.exchange("/api/action", request, token=token)[0], 403)
+        saved = self.client.request("/api/action", request)
+        self.assertEqual(self.store.operator_policy()["model"], "test-model")
+        self.assertTrue(saved["overridden"])
+        self.assertEqual(self.client.exchange("/api/action", request)[0], 400)
+        self.store.db.close()
+        self.server.store = self.store = Store(Path(self.tmp.name)/"state.db")
+        self.assertEqual(self.client.snapshot()["settings"], saved)
+        for bad in ({"preferred_phase_minutes": True}, {"approve_inbox": 1}, {"provider": "command"}, {"command": ["custom"]}):
+            with self.subTest(bad=bad), self.assertRaises(RuntimeError):
+                self.client.action("save_settings", expected=saved, settings={**fields, **bad})
+        self.assertEqual(self.client.action("save_settings", expected=saved, settings=None), original)
+    def test_board_decision_reaches_waiting_codex_command(self):
+        from contextlib import redirect_stderr
+        from arbiter.adapters import run_agent
+
+        # A stdio peer that can only finish after receiving the answer to its request.
+        peer = """
+import json, signal, sys
+signal.alarm(8)
+def receive():
+    return json.loads(sys.stdin.readline())
+def send(message):
+    print(json.dumps(message), flush=True)
+initialize = receive()
+send({"id": initialize["id"], "result": {}})
+assert receive()["method"] == "initialized"
+thread = receive()
+send({"id": thread["id"], "result": {"thread": {"id": "test-thread"}}})
+turn = receive()
+send({"id": turn["id"], "result": {"turn": {"id": "turn"}}})
+send({"method": "item/commandExecution/requestApproval", "id": 3, "params": {"itemId": "cmd"}})
+assert receive() == {"id": 3, "result": {"decision": "accept"}}
+send({"method": "item/completed", "params": {"item": {
+    "id": "cmd", "type": "commandExecution", "status": "completed", "exitCode": 0}}})
+send({"method": "turn/completed", "params": {"turn": {"status": "completed"}}})
+"""
+        snapshot = self.client.snapshot
+        def answer_from_board():
+            state = snapshot()
+            for aid, approval in state["approvals"].items():
+                if approval["state"] == "pending":
+                    self.client.action("approval_answer", session=approval["session"],
+                                       approval=aid, response={"decision": "accept"})
+            return state
+
+        self.client.url = "http://127.0.0.1:7483"
+        args = SimpleNamespace(provider="codex", cwd=self.tmp.name, name="test", prompt="test",
+                               resume=None, model=None, once=True)
+        terminal = io.StringIO()
+        with patch("arbiter.adapters.Client", return_value=self.client), \
+             patch("arbiter.adapters.signal.signal"), \
+             patch("arbiter.adapters.codex_command", return_value=[sys.executable, "-u", "-c", peer]), \
+             patch.object(self.client, "snapshot", side_effect=answer_from_board), redirect_stderr(terminal):
+            run_agent(args)
+        aid, = snapshot()["approvals"]
+        self.assertIn(f"Sent response for {aid} to codex.", terminal.getvalue())
+        self.assertIn(f"Codex command for {aid}: completed (exit 0).", terminal.getvalue())
+
     def test_http_auth_and_host_origin_validation(self):
         self.assertEqual(self.client.exchange('/api/state',token=None)[0],401)
         self.assertEqual(self.client.exchange('/api/state',headers={'Host':'evil.example'})[0],403)
@@ -83,7 +220,7 @@ class HTTPMCPTests(unittest.TestCase):
         self.assertEqual(code,200)
         self.assertIn(b'SameSite=Strict',head)
         self.assertIn(b'HttpOnly',head)
-        self.assertIn(b'Message board',body)
+        self.assertIn(b'<div id="root"></div>',body)
         self.assertIn(b"script-src 'self'",head)
         self.assertEqual(self.client.exchange('/?k='+secret,token=None)[0],401)
         # An existing cookie keeps working without a new secret and is not reissued.
@@ -95,6 +232,33 @@ class HTTPMCPTests(unittest.TestCase):
         a=self.session()
         token=self.store.state['sessions'][a]['token']
         self.assertEqual(self.client.exchange('/api/launch',{},token=token)[0],403)
+    def test_conversation_requires_operator_and_uses_registered_metadata(self):
+        sid = self.client.action("register", name="editor", kind="codex")["id"]
+        token = self.store.state["sessions"][sid]["token"]
+        external_id = "01234567-89ab-cdef-0123-456789abcdef"
+        self.client.action("conversation", session=sid, provider="codex", external_id=external_id)
+        path = f"/api/conversation?session={sid}"
+        self.assertEqual(self.client.exchange(path, token=None)[0], 401)
+        self.assertEqual(self.client.exchange(path, token=token)[0], 403)
+        self.assertEqual(self.client.exchange(path + "&before=-1")[0], 400)
+        with patch("arbiter.server.transcripts.conversation", return_value={"messages": [], "before": None}) as reader:
+            self.assertEqual(self.client.request(path + "&before=123"), {"messages": [], "before": None})
+        reader.assert_called_once_with("codex", external_id, 123)
+    def test_operator_messages_and_direct_replies(self):
+        alice, bob = self.session("alice"), self.session("bob")
+        token = self.store.state["sessions"][alice]["token"]
+        direct = self.client.action("operator_message", to=alice, text="Update?")
+        broadcast = self.client.action("operator_message", text="Hello everyone")
+        self.assertIsNone(direct["from"])
+        self.assertEqual(self.client.inbox(alice)["messages"], [direct, broadcast])
+        self.assertEqual(self.client.inbox(bob)["messages"], [broadcast])
+        reply = {"action": "message", "data": {"session": alice, "to": "arbiter", "text": "Ready", "reply_to": direct["id"]}}
+        code, _, raw = self.client.exchange("/api/action", reply, token=token)
+        self.assertEqual(code, 200)
+        self.assertEqual(json.loads(raw)["to"], "arbiter")
+        self.assertEqual(self.client.inbox(bob)["messages"], [broadcast])
+        reply["action"] = "operator_message"
+        self.assertEqual(self.client.exchange("/api/action", reply, token=token)[0], 403)
     def test_linux_browser_sign_in(self):
         self.server.login_lock = threading.Lock()
         self.server.next_login = 0

@@ -39,7 +39,7 @@ class ApprovalTests(unittest.TestCase):
                     {"method": "claude/can_use_tool", "params": {"input": {"command": "pwd"}}}]
         code = """const fs=require('node:fs'),vm=require('node:vm');
 const context={};vm.createContext(context);
-vm.runInContext(fs.readFileSync(process.argv[1],'utf8').split('let state =')[0],context);
+vm.runInContext(fs.readFileSync(process.argv[1],'utf8'),context);
 const fixtures=JSON.parse(fs.readFileSync(0,'utf8'));
 process.stdout.write(JSON.stringify(fixtures.map(a=>[true,false].map(allow=>context.ArbiterApprovals.response(a,allow)))));"""
         p = subprocess.run(["node", "-e", code, source], input=json.dumps(fixtures), capture_output=True, text=True, check=True)

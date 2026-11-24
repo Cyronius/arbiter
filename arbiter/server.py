@@ -3,8 +3,10 @@ import hmac
 import json
 import os
 import secrets
+import signal
 import socket
 import socketserver
+import stat
 import sys
 import threading
 import time
@@ -14,24 +16,39 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from . import pam
-from .client import state_dir
-from .core import Store
+from . import operator, pam, recovery, system, transcripts
+from .client import board_location, state_dir
+from .config import Config
+from .core import PROVIDERS, TERMINAL, Store
 
+system_memory = system.memory
 
-def system_memory():
-    try:
-        info = dict(line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())
-        return {"total_mb": int(info["MemTotal"].split()[0]) // 1024,
-                "available_mb": int(info["MemAvailable"].split()[0]) // 1024,
-                "load": list(os.getloadavg())}
-    except (OSError, KeyError, ValueError):
-        return {}
-
-
-# Everything a session-scoped token may do, and only to its own session.
+# Everything a session-scoped token may do, and only to its own session. A session token may
+# also register child job/hold sessions under itself (see `permitted`).
 SESSION_ACTIONS = {"heartbeat", "report", "reserve", "release", "checkpoint", "delivered", "finish",
-                   "message", "ack_message", "approval_request"}
+                   "message", "ack_message", "approval_request", "track", "extend", "requeue", "handoff", "hook", "adopt", "cancelling"}
+# What a session may do to the job and hold sessions it registered (e.g. `arbiter release gpu`).
+CHILD_ACTIONS = {"finish", "extend", "report"}
+
+
+def permitted(who, action, data, store=None):
+    """Whether a session-scoped principal may perform `action` with `data`. Returns an error or None."""
+    if action == "register":
+        if data.get("auto_retry"):
+            return "operator token required to enable automatic retries"
+        if data.get("parent") != who or data.get("kind") not in {"job", "hold"}:
+            return "session tokens may only register job or hold sessions under themselves"
+        if data.get("provider") is not None:
+            return "session tokens may not register provider sessions"
+        return None
+    if action not in SESSION_ACTIONS:
+        return "operator token required for this action"
+    if data.get("session") != who:
+        child = store.state["sessions"].get(data.get("session")) if store and isinstance(data.get("session"), str) else None
+        if action in CHILD_ACTIONS and child and child.get("parent") == who:
+            return None
+        return "session tokens may only act on their own session"
+    return None
 
 
 class Launcher:
@@ -66,6 +83,7 @@ class Server(ThreadingHTTPServer):
         self.next_login = 0
         self.stopping = threading.Event()
         self.telemetry = system_memory()
+        self.context_samples = {}
         self.unix = isinstance(address, str)
         if self.unix:
             self.address_family = socket.AF_UNIX
@@ -177,8 +195,27 @@ class Handler(BaseHTTPRequestHandler):
                     return self.response(400, {"error": "invalid wait parameters"})
                 self.server.store.wait_for_change(wait, timeout)
             state = self.server.store.snapshot()
+            samples = self.server.context_samples
+            for session in state["sessions"].values():
+                sample = samples.get((session.get("provider"), session.get("external_id")))
+                if sample and sample.usage is not None and session["state"] not in TERMINAL:
+                    session["context_usage"] = sample.usage
             state["telemetry"] = self.server.telemetry
+            state["conversation_viewer"] = who == "operator"
+            if who != "operator":
+                # Session clients need scheduler state, not the operator's saved prompts.
+                state["settings"].pop("instructions", None)
+                state["settings"].pop("presets", None)
+                state["operator"].pop("instructions", None)
             return self.response(200, state)
+        if url.path == "/api/disk":
+            try:
+                path, gb = query["path"][0], float(query.get("gb", ["0"])[0])
+                if not path.startswith("/"):
+                    raise ValueError("path must be absolute")
+                return self.response(200, self.server.store.disk_check(path, gb))
+            except (KeyError, ValueError, OSError) as e:
+                return self.response(400, {"error": str(e)})
         if url.path == "/api/inbox":
             sid = query.get("session", [None])[0]
             if who != "operator" and sid != who:
@@ -189,6 +226,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self.response(400, {"error": str(e)})
         if who != "operator":
             return self.response(403, {"error": "operator token required"})
+        if url.path == "/api/conversation":
+            try:
+                before = int(query["before"][0]) if "before" in query else None
+                if before is not None and not 0 < before <= 2**63 - 1:
+                    raise ValueError
+            except ValueError:
+                return self.response(400, {"error": "Invalid conversation cursor"})
+            with self.server.store.lock:
+                session = self.server.store.state["sessions"].get(query.get("session", [""])[0], {})
+                provider, external_id = session.get("provider"), session.get("external_id")
+            page = transcripts.conversation(provider, external_id, before)
+            if page is None:
+                return self.response(404, {"error": "No local conversation log is available for this session."})
+            return self.response(200, page)
         if url.path in {"/api/events", "/events"}:
             try:
                 cursor = max(0, int(query.get("after", ["0"])[0]), int(self.headers.get("Last-Event-ID", "0")))
@@ -244,24 +295,26 @@ class Handler(BaseHTTPRequestHandler):
             return self.response(404, {"error": "not found"})
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if not 0 < length <= 65536:
-                raise ValueError("body must be 1–65536 bytes")
+            # A settings edit includes both the expected and proposed preset library.
+            limit = 4 * 1024 * 1024 if who == "operator" else 65536
+            if not 0 < length <= limit:
+                raise ValueError(f"body must be 1–{limit} bytes")
             d = json.loads(self.rfile.read(length))
             if not isinstance(d, dict) or not isinstance(d.get("data", {}), dict):
                 raise ValueError("expected JSON object with action and data")
             action = d.get("action")
-            if not isinstance(action, str) or action in {"reconcile", "tick"}:
+            if length > 65536 and action != "save_settings":
+                raise ValueError("body must be 1–65536 bytes")
+            if not isinstance(action, str) or action in {"reconcile", "tick", "operator_decision", "operator_events_reviewed", "dispatch", "auto_recover", "retry_blocked"}:
                 raise ValueError("internal action")
             if who != "operator":
-                if action not in SESSION_ACTIONS:
-                    return self.response(403, {"error": "operator token required for this action"})
-                if d.get("data", {}).get("session") != who:
-                    return self.response(403, {"error": "session tokens may only act on their own session"})
+                refusal = permitted(who, action, d.get("data", {}), self.server.store)
+                if refusal:
+                    return self.response(403, {"error": refusal})
             result = self.server.store.apply(action, d.get("data", {}))
             return self.response(200, result)
         except (ValueError, TypeError, KeyError) as e:
             return self.response(400, {"error": str(e)})
-
 
     def login_page(self, status, message=""):
         page = (Path(__file__).parent / "static" / "login.html").read_bytes()
@@ -302,6 +355,28 @@ class Handler(BaseHTTPRequestHandler):
             self.server.next_login = time.monotonic() + 5
 
 
+def refresh_context(server):
+    with server.store.lock:
+        conversations = {(s["provider"], s["external_id"]) for s in server.store.state["sessions"].values()
+                         if s["state"] not in TERMINAL and s.get("provider") in PROVIDERS
+                         and transcripts.valid_id(s.get("external_id"))}
+    samples = {}
+    for key in conversations:
+        try:
+            sample = transcripts.sample_context(*key, previous=server.context_samples.get(key))
+        except OSError:
+            continue
+        if sample is not None:
+            samples[key] = sample
+    server.context_samples = samples
+
+
+def monitor_context(server):
+    while not server.stopping.is_set():
+        refresh_context(server)
+        server.stopping.wait(15)
+
+
 def write_private(path, content):
     """Create a file readable only by the owner from the first byte (no chmod-after-write window)."""
     tmp = path.with_name(path.name + ".tmp")
@@ -321,45 +396,91 @@ def serve(args):
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        raise RuntimeError("An Arbiter daemon already owns this state directory") from None
+        lock.close()
+        try:
+            url = json.loads((directory / "connection.json").read_text())["url"]
+        except (OSError, KeyError, ValueError):
+            raise RuntimeError("Arbiter has the daemon lock but its address is not available yet") from None
+        print(f"Arbiter is already running.\n{board_location(url)}")
+        return
+    meter = system.CpuMeter()
     memory = system_memory()
+    config = Config()
+    if config.error:
+        print(f"arbiter: ignoring invalid config: {config.error}", file=sys.stderr)
     store = Store(directory / "arbiter.sqlite3", args.cpu or max(1, (os.cpu_count() or 2) * .8),
                   args.memory_mb or max(256, int(memory.get("total_mb", 8192) * .7)), headroom_mb=args.headroom_mb,
-                  retention_days=args.retention_days or None)
-    store.available_mb = memory.get("available_mb")
-    token = secrets.token_urlsafe(32)
+                  retention_days=args.retention_days or None, config=config,
+                  initial_telemetry=dict(memory, cpu_busy=meter.sample(), gpu_pressure=system.gpu_pressure()))
+    connection = directory / "connection.json"
+    # Keep the operator token across restarts so running wrappers and supervisors, which read it
+    # once, can reconnect to a restarted daemon instead of failing authentication.
+    previous = {}
+    try:
+        previous = json.loads(connection.read_text())
+    except (OSError, ValueError):
+        pass
+    token = previous.get("token")
+    token = token if isinstance(token, str) and len(token) >= 32 else secrets.token_urlsafe(32)
     address = str(Path(args.unix_socket).resolve()) if args.unix_socket else ("127.0.0.1", args.port)
+    if args.unix_socket and previous.get("url") == "unix://" + address:
+        # SIGKILL leaves a socket inode behind. Under the state-directory lock,
+        # reclaim our old address only if there is no listener.
+        path = Path(address)
+        try:
+            if stat.S_ISSOCK(path.lstat().st_mode):
+                with socket.socket(socket.AF_UNIX) as probe:
+                    probe.connect(address)
+        except ConnectionRefusedError:
+            path.unlink()
+        except FileNotFoundError:
+            pass
     server = Server(address, store, token)
     url = "unix://" + address if args.unix_socket else f"http://127.0.0.1:{server.server_port}"
-    connection = directory / "connection.json"
     write_private(connection, json.dumps({"url": url, "token": token}))
 
     def monitor():
+        children = []
         while not server.stopping.wait(3):
             server.telemetry = system_memory()
-            store.apply("tick", {"available_mb": server.telemetry.get("available_mb")})
+            busy = meter.sample()
+            server.telemetry["cpu_busy"] = busy
+            gpu_pressure = system.gpu_pressure()
+            try:
+                store.apply("tick", {"available_mb": server.telemetry.get("available_mb"), "cpu_busy": busy,
+                                     "gpu_pressure": gpu_pressure})
+                recovery.dispatch(store, url, children)
+            except Exception as e:  # never let one bad tick stop liveness checks
+                traceback.print_exception(e, file=sys.stderr)
 
     monitor_thread = threading.Thread(target=monitor, daemon=True)
     monitor_thread.start()
+    context_thread = threading.Thread(target=monitor_context, args=(server,), daemon=True)
+    context_thread.start()
+    operator_thread = threading.Thread(target=operator.run, args=(store, server.stopping), daemon=True)
+    operator_thread.start()
     print(f"Arbiter listening at {url}", flush=True)
     if not args.unix_socket:
         print(f"Sign in to the board at {url}/\n"
               f"One-time launch link: {url}/?k={server.launcher.mint(ttl=None)}", flush=True)
+    def terminate(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, terminate)
     try:
         server.serve_forever(poll_interval=.25)
     except KeyboardInterrupt:
         pass
     finally:
         server.stopping.set()
+        with store.changed:
+            store.changed.notify_all()
         monitor_thread.join(timeout=5)
+        context_thread.join()
+        operator_thread.join(timeout=5)
         server.server_close()
         with store.lock:
             store.db.close()
         if args.unix_socket:
             Path(address).unlink(missing_ok=True)
-        try:
-            if json.loads(connection.read_text()).get("token") == token:
-                connection.unlink()
-        except (OSError, ValueError):
-            pass
+        # connection.json stays (owner-only) so clients wait for a restart rather than giving up.
         lock.close()

@@ -1,11 +1,8 @@
 import argparse
-import io
-import json
 import os
 import queue
 import subprocess
 import sys
-import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -16,7 +13,7 @@ from arbiter.workers import group_alive
 
 
 class FakeTransport:
-    def __init__(self, argv, cwd, env):
+    def __init__(self, argv, cwd, env, track=None):
         self.argv, self.cwd, self.env = argv, cwd, env
         self.sent = []
         self.incoming = queue.Queue()

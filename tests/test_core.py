@@ -4,8 +4,9 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from arbiter.core import Store
+from arbiter.core import SCHEMA_VERSION, STALE_CHECK_COOLDOWN_S, STALE_CHECK_TIMEOUT_S, Store
 
 
 class CoreTests(unittest.TestCase):
@@ -55,6 +56,20 @@ class CoreTests(unittest.TestCase):
         self.apply("finish", a, safe=True)
         self.assertEqual(self.store.snapshot()["sessions"][c]["state"], "running")
 
+    def test_promoted_bundle_gets_the_next_conflicting_slot(self):
+        owner = self.session()
+        self.apply("reserve", owner, exclusive=["gpu"])
+        bundle = self.apply("reserve", self.session(), exclusive=["gpu", "npu"])
+        self.store.apply("promote", {"reservation": bundle["id"]})
+        competing = self.apply("reserve", self.session(), exclusive=["npu"], priority=100)
+        self.assertEqual(competing["state"], "requested")
+        self.assertEqual(self.apply("reserve", self.session(), exclusive=["disk-io"])["state"], "granted")
+        self.apply("finish", owner, safe=True)
+        reservations = self.store.snapshot()["reservations"]
+        self.assertEqual(reservations[bundle["id"]]["state"], "granted")
+        self.assertNotIn("promotion_order", reservations[bundle["id"]])
+        self.assertEqual(reservations[competing["id"]]["state"], "requested")
+
     def test_concurrent_exclusive_requests_have_one_winner(self):
         sessions = [self.session(str(i)) for i in range(16)]
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
@@ -73,6 +88,63 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(state["reservations"][rb["id"]]["state"], "requested")
         self.apply("heartbeat", a)
         self.assertEqual(self.store.snapshot()["sessions"][a]["state"], "running")
+
+    def test_stale_blocker_check_is_deliverable_and_retries_after_cooldown(self):
+        holder, waiter, other = self.session("holder"), self.session("waiter"), self.session("other")
+        held = self.apply("reserve", holder, exclusive=["gpu"])
+        self.store.beats[holder] -= 100
+        self.store.apply("tick", {})
+        self.assertFalse(self.store.inbox(holder)["commands"])
+        queued = self.apply("reserve", waiter, exclusive=["gpu"])
+        self.apply("reserve", other, exclusive=["gpu"])
+        first, = self.store.inbox(holder)["commands"]
+        self.assertIn("waiter is waiting", first["reason"])
+
+        late = first["created"] + 2 * STALE_CHECK_COOLDOWN_S
+        with patch("arbiter.core.time.time", return_value=late):
+            self.store.apply("tick", {})
+            state = self.store.snapshot()
+            self.assertEqual(state["sessions"][holder]["stale_check"]["unanswered_since"], first["deadline"])
+            self.assertEqual(state["reservations"][held["id"]]["state"], "granted")
+            self.assertEqual(state["reservations"][queued["id"]]["state"], "requested")
+            self.assertEqual(self.store.inbox(holder)["commands"], [first])
+            delivered, = self.apply("hook", holder, collect=True)["inbox"]["commands"]
+            self.assertEqual(delivered["id"], first["id"])
+            self.assertEqual(delivered["deadline"], late + STALE_CHECK_TIMEOUT_S)
+
+        with patch("arbiter.core.time.time", return_value=late + STALE_CHECK_COOLDOWN_S - 1):
+            self.store.apply("tick", {})
+            unanswered, = self.store.inbox(holder)["commands"]
+            self.assertEqual(unanswered["id"], first["id"])
+            self.assertEqual(unanswered["state"], "unanswered")
+
+        with patch("arbiter.core.time.time", return_value=late + STALE_CHECK_COOLDOWN_S):
+            self.store.apply("tick", {})
+            retry, = self.store.inbox(holder)["commands"]
+            self.assertNotEqual(retry["id"], first["id"])
+            self.apply("report", holder, status="Still using the GPU", command=retry["id"])
+        state = self.store.snapshot()
+        self.assertEqual(state["sessions"][holder]["state"], "running")
+        self.assertNotIn("unanswered_since", state["sessions"][holder]["stale_check"])
+        self.assertEqual(state["reservations"][held["id"]]["state"], "granted")
+        self.assertFalse(self.store.inbox(holder)["commands"])
+        self.assertEqual(sum(event["kind"] == "session.stale_check_unanswered" for event in self.store.events()), 1)
+
+    def test_stale_blocker_alert_clears_after_waiter_leaves(self):
+        holder, waiter = self.session(), self.session()
+        held = self.apply("reserve", holder, cpu=2)
+        self.apply("reserve", waiter, cpu=1)
+        self.store.beats[holder] -= 100
+        self.store.apply("tick", {})
+        first, = self.store.inbox(holder)["commands"]
+        with patch("arbiter.core.time.time", return_value=first["deadline"] + 1):
+            self.store.apply("tick", {})
+            self.assertIn("unanswered_since", self.store.snapshot()["sessions"][holder]["stale_check"])
+            self.apply("finish", waiter, safe=True)
+        state = self.store.snapshot()
+        self.assertEqual(state["reservations"][held["id"]]["state"], "granted")
+        self.assertNotIn("unanswered_since", state["sessions"][holder]["stale_check"])
+        self.assertFalse(self.store.inbox(holder)["commands"])
 
     def test_restart_retains_reservations_and_events(self):
         a = self.session()
@@ -237,7 +309,7 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(any(e["kind"] == "state.pruned" for e in self.store.events()))
 
     def test_schema_version_is_recorded_and_newer_state_is_refused(self):
-        self.assertEqual(self.store.state["schema_version"], 1)
+        self.assertEqual(self.store.state["schema_version"], SCHEMA_VERSION)
         self.store.state["schema_version"] = 99
         self.store.db.execute("INSERT OR REPLACE INTO state VALUES (1, ?)", (json.dumps(self.store.state),))
         self.store.db.commit()
