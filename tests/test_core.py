@@ -48,6 +48,25 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.store.snapshot()["sessions"][a]["state"], "running")
         self.assertEqual(self.store.snapshot()["reservations"][ra["id"]]["state"], "granted")
 
+    def test_waiting_grant_notifies_the_owning_conversation_once(self):
+        holder, parent, other = self.session(), self.session(kind="claude"), self.session()
+        job = self.session(kind="job", parent=parent)
+        self.apply("reserve", holder, exclusive=["gpu"])
+        resources = ["gpu", *[f"resource-{i}-" + "x" * 235 for i in range(63)]]
+        req = self.apply("reserve", job, exclusive=resources)
+        self.apply("reserve", other, exclusive=["gpu"])
+        self.assertFalse(self.store.inbox(holder)["messages"])
+        self.assertFalse(self.store.inbox(parent)["messages"])
+        self.apply("finish", holder, safe=True)
+        self.store.apply("tick", {})
+        message, = self.store.inbox(parent)["messages"]
+        self.assertIn(req["id"], message["text"])
+        self.assertIn("gpu", message["text"])
+        self.assertIn("58 more", message["text"])
+        self.assertFalse(self.store.inbox(other)["messages"])
+        self.apply("finish", job, safe=True)
+        self.assertEqual(len(self.store.inbox(other)["messages"]), 1)
+
     def test_cpu_and_memory_share_but_do_not_exceed_budget(self):
         a, b, c = (self.session() for _ in range(3))
         self.assertEqual(self.apply("reserve", a, cpu=.75, memory_mb=400)["state"], "granted")
@@ -266,6 +285,23 @@ class CoreTests(unittest.TestCase):
         req=self.apply("approval_request", a, method="item/fileChange/requestApproval", params={"reason":"edit"})
         self.apply("approval_answer",a,approval=req["id"],response={"decision":"decline"})
         self.assertEqual(self.store.snapshot()["approvals"][req["id"]]["response"],{"decision":"decline"})
+
+    def test_approvals_close_when_no_answer_can_be_delivered(self):
+        a = self.session()
+        withdrawn = self.apply("approval_request", a, method="claude/can_use_tool", params={})
+        self.apply("approval_cancel", a, approval=withdrawn["id"], reason="claude withdrew the request")
+        self.assertEqual(self.store.snapshot()["approvals"][withdrawn["id"]]["state"], "cancelled")
+        with self.assertRaisesRegex(ValueError, "cancelled: claude withdrew"):
+            self.apply("approval_answer", a, approval=withdrawn["id"], response={"behavior": "allow"})
+        answered = self.apply("approval_request", a, method="claude/can_use_tool", params={})
+        self.apply("approval_answer", a, approval=answered["id"], response={"behavior": "deny"})
+        self.apply("approval_cancel", a, approval=answered["id"])  # the provider confirms resolution
+        open_ = self.apply("approval_request", a, method="claude/can_use_tool", params={})
+        self.apply("finish", a, safe=True)
+        approvals = self.store.snapshot()["approvals"]
+        self.assertEqual(approvals[answered["id"]]["state"], "answered")
+        self.assertEqual((approvals[open_["id"]]["state"], approvals[open_["id"]]["reason"]),
+                         ("cancelled", "The session ended before an answer"))
 
     def test_heartbeat_is_not_persisted_but_revives_stale_sessions(self):
         a = self.session()

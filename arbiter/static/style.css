@@ -113,6 +113,8 @@ p, strong, h3, dd { overflow-wrap: anywhere; }
 .session-report p + p { margin-top: .15rem; }
 .session-name h3, .reservation-heading strong { font-size: .9rem; }
 .session-name p, .reservation-note { color: var(--muted); font-size: .8rem; }
+.attention-note { color: var(--warn-ink); font-size: .8rem; }
+.attention-note code { overflow-wrap: anywhere; }
 .status { display: inline-block; background: var(--alternate); color: var(--ink); font-size: .76rem; font-weight: 690; border-radius: 3px; padding: .075rem .38rem; white-space: nowrap; }
 .status-running, .status-granted { color: var(--accent); }
 .status-waiting, .status-approval, .status-stale, .status-paused, .status-draining, .status-failed { background: var(--warn-bg); color: var(--warn-ink); }
@@ -258,3 +260,114 @@ dialog::backdrop { background: #0e1b25a6; }
 
 .event-option { display: flex; align-items: baseline; gap: .55rem; margin-top: .55rem; font-size: .9rem; }
 .event-option input { flex: none; align-self: flex-start; margin-top: .2rem; }
+
+.conversation-log article[data-role="user"] { padding-inline: .75rem; border-inline-start: 3px solid var(--line); }
+.conversation-log article[aria-current="step"] { border-inline-start-color: var(--ink); }
+.conversation-log article[data-role="activity"] { padding: .4rem .75rem; font-size: .85rem; }
+.conversation-log pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: .6rem; background: var(--paper); }
+.conversation-log summary { cursor: pointer; }
+
+/* Conversation viewer: speakers, Markdown and code colors */
+:root {
+  --speaker-user: #8bd5ec;
+  --speaker-claude: #f0a67a;
+  --speaker-codex: #9fdc9a;
+  --speaker-gaia: #c7a6f5;
+  --tok-keyword: #c9a2f7;
+  --tok-string: #b5e08c;
+  --tok-number: #f6a978;
+  --tok-comment: #8a9cb6;
+  --tok-function: #8bc7f7;
+  --tok-type: #f3d37a;
+  --tok-variable: #f2a5c4;
+  --tok-add-bg: #1f4a35;
+  --tok-add: #b6f0c6;
+  --tok-del-bg: #55262c;
+  --tok-del: #ffc2c7;
+  --code-bg: #0f1826;
+}
+dialog:has(.conversation-log) { width: min(62rem, calc(100% - 2rem)); }
+.conversation-log { max-height: 60vh; }
+.conversation-log article { --speaker: var(--speaker-codex); padding: .7rem .85rem; border-bottom: 0; border-inline-start: 3px solid transparent; }
+.conversation-log article + article { border-top: 1px solid color-mix(in srgb, var(--line) 55%, transparent); }
+.conversation-log article[data-provider="claude"] { --speaker: var(--speaker-claude); }
+.conversation-log article[data-provider="gaia"] { --speaker: var(--speaker-gaia); }
+.conversation-log article[data-role="assistant"] { border-inline-start-color: color-mix(in srgb, var(--speaker) 55%, transparent); }
+.conversation-log article[data-role="user"] { --speaker: var(--speaker-user); border-inline-start-color: var(--speaker-user);
+  background: color-mix(in srgb, var(--speaker-user) 7%, transparent); }
+.conversation-log article[aria-current="step"] { border-inline-start-color: var(--ink); }
+.conversation-log article > h3 { color: var(--speaker); font-size: .8rem; letter-spacing: .02em; text-transform: uppercase; margin-bottom: .2rem; }
+.conversation-log article[data-role="activity"] { padding: .3rem .85rem; font-size: .82rem; }
+.conversation-log article[data-role="activity"] summary, .conversation-log article[data-role="activity"] small { color: var(--tok-comment); font-family: ui-monospace, "JetBrains Mono", monospace; }
+.conversation-log article[data-role="activity"] summary::marker { color: var(--speaker); }
+
+.md { overflow-wrap: anywhere; }
+.md > * + * { margin-top: .55rem; }
+.conversation-log .md p { white-space: normal; }
+.md :is(h4, h5, h6) { font-size: 1rem; color: var(--ink); }
+.md .md-h1 { font-size: 1.15rem; }
+.md .md-h2 { font-size: 1.05rem; }
+.md .md-h3, .md .md-h4, .md .md-h5, .md .md-h6 { font-size: .95rem; color: var(--muted); }
+.md :is(ul, ol) { padding-inline-start: 1.4rem; }
+.md li + li { margin-top: .2rem; }
+.md li > :is(ul, ol, p, pre) { margin-top: .25rem; }
+.md li.md-task { list-style: none; margin-inline-start: -1.2rem; }
+.md li.md-task input { margin-inline-end: .4rem; vertical-align: -.1em; }
+.md strong { color: var(--ink); font-weight: 680; }
+.md em { color: color-mix(in srgb, var(--ink) 88%, var(--speaker, var(--accent))); }
+.md a, .md .md-link { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+.md blockquote { border-inline-start: 3px solid var(--line); padding-inline-start: .75rem; color: var(--muted); }
+.md hr { border: 0; border-top: 1px solid var(--line); }
+.md :not(pre) > code { font-family: ui-monospace, "JetBrains Mono", monospace; font-size: .86em; padding: .05rem .3rem; border-radius: 4px;
+  background: var(--code-bg); color: var(--tok-type); }
+.md-table { overflow-x: auto; }
+.md table { border-collapse: collapse; font-size: .88rem; }
+.md :is(th, td) { border: 1px solid var(--line); padding: .3rem .55rem; vertical-align: top; }
+.md th { background: var(--alternate); font-weight: 650; }
+.md tbody tr:nth-child(even) { background: color-mix(in srgb, var(--alternate) 40%, transparent); }
+
+.conversation-log pre.md-code, pre.md-code { position: relative; margin: 0; padding: .65rem .75rem; border-radius: 8px; background: var(--code-bg);
+  border: 1px solid color-mix(in srgb, var(--line) 70%, transparent); font-size: .84rem; line-height: 1.45; white-space: pre; overflow-x: auto; overflow-wrap: normal; }
+pre.md-code code { font-family: ui-monospace, "JetBrains Mono", monospace; }
+.md-code-block { position: relative; }
+.md-code-block pre.md-code { padding-inline-end: 2.6rem; }
+.md-code-tools { position: absolute; top: .3rem; right: .3rem; display: flex; align-items: center; gap: .35rem; }
+.md-code-lang { font-size: .7rem; color: var(--tok-comment); }
+dialog .md-code-tools .icon-button.md-copy { width: 1.7rem; height: 1.7rem; background: color-mix(in srgb, var(--code-bg) 70%, var(--alternate)); opacity: .75; }
+.md-code-block:hover .md-copy, .md-copy:focus-visible { opacity: 1; }
+.md-copy.is-copied { color: var(--speaker-codex); opacity: 1; }
+.md-copy.is-failed { color: var(--warn-ink); opacity: 1; }
+.md-copy::after { inset-inline: auto 0; }
+details > .md-code-block { margin-top: .35rem; }
+.tok-keyword { color: var(--tok-keyword); }
+.tok-string { color: var(--tok-string); }
+.tok-key { color: var(--tok-function); }
+.tok-number { color: var(--tok-number); }
+.tok-comment { color: var(--tok-comment); font-style: italic; }
+.tok-function { color: var(--tok-function); }
+.tok-type { color: var(--tok-type); }
+.tok-variable { color: var(--tok-variable); }
+.tok-line { display: block; min-width: max-content; }
+.tok-add { background: var(--tok-add-bg); color: var(--tok-add); }
+.tok-del { background: var(--tok-del-bg); color: var(--tok-del); }
+.tok-hunk { color: var(--tok-keyword); }
+.tok-file { color: var(--ink); font-weight: 650; }
+
+.conversation-thread { margin-top: .6rem; border: 1px solid var(--line); border-radius: 8px; padding: .4rem .7rem; }
+.conversation-thread summary { cursor: pointer; color: var(--muted); font-size: .85rem; }
+.conversation-thread ol { list-style: none; padding: 0; max-height: 14rem; overflow: auto; }
+.conversation-thread li { padding: .45rem 0 .45rem .6rem; border-inline-start: 3px solid var(--speaker-user); margin-top: .4rem; }
+.conversation-thread li[data-from="session"] { border-inline-start-color: var(--speaker-codex); }
+.conversation-thread .md p { white-space: normal; }
+.conversation-compose { margin-top: .7rem; }
+.compose-field { position: relative; }
+.compose-field textarea { display: block; width: 100%; resize: vertical; min-height: 2.9rem; padding-inline-end: 4rem; }
+.compose-field .icon-button { position: absolute; right: 1.35rem; bottom: .45rem; }
+.compose-field .icon-button:disabled { opacity: .45; }
+.conversation-compose .notice, .conversation-compose .compose-hint { margin: 0; font-size: .78rem; }
+.compose-field .icon-button::after { inset-inline: auto 0; }
+.delivery { margin-inline-start: .45rem; font-size: .72rem; font-weight: 650; padding: .05rem .35rem; border-radius: 3px; }
+.delivery.is-delivered { color: var(--speaker-codex); background: color-mix(in srgb, var(--speaker-codex) 12%, transparent); }
+.delivery.is-waiting { color: var(--warn-ink); background: var(--warn-bg); }
+.conversation-log article[data-role="peer"] { --speaker: var(--speaker-gaia); border-inline-start-color: var(--speaker-gaia);
+  background: color-mix(in srgb, var(--speaker-gaia) 7%, transparent); }

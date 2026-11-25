@@ -37,10 +37,9 @@ def main():
             workers.ignore_signals()
             client.action("finish", session=sid, safe=True, failed=True, cancelled=True, status="Cancelled before provider launch")
             return
-        with transcripts.open_transcript(ticket["kind"], ticket["guid"]) as transcript:
-            if transcript is None:
-                client.action("finish", session=sid, safe=True, failed=True, status="Provider transcript unavailable at launch")
-                return
+        if not transcripts.can_resume(ticket["kind"], ticket["guid"]):
+            client.action("finish", session=sid, safe=True, failed=True, status="Provider transcript unavailable at launch")
+            return
         args = SimpleNamespace(provider=ticket["kind"], cwd=ticket["cwd"], resume=ticket["guid"],
                                prompt=ticket["prompt"], model=None, once=True)
         adapters.run_agent(args, client=client, registered={"id": sid, "token": client.token, "external_id": ticket["guid"]})

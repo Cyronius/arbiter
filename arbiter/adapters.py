@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 from .client import Client
+from .gaia import Gaia
 from .launch import STOP_SIGNALS, WINDOWS, command_args, isolated_options, signal_group, tracked_popen, work_alive
 from .config import phase_guidance
 from .transcripts import valid_id
@@ -82,6 +83,7 @@ class Codex:
         self.command_approvals = {}
         self.starting, self.queued, self.sent_input = False, [], {}
         self.done = False
+        self.withdrawn = []  # provider request IDs that no longer take an answer
         self.call("initialize", {"clientInfo": {"name": "arbiter", "title": "Arbiter", "version": "0.1.0"}}, "initialize")
 
     def call(self, method, params, purpose=None):
@@ -145,6 +147,9 @@ class Codex:
         method, params = msg.get("method"), msg.get("params", {})
         if method == "turn/started":
             self.turn = params["turn"]["id"]
+        if method == "serverRequest/resolved" and "requestId" in params:
+            # Also sent after our own answer; the supervisor ignores requests it already answered.
+            self.withdrawn.append(params["requestId"])
         if method == "item/completed" and params.get("item", {}).get("type") == "commandExecution":
             item = params["item"]
             aid = self.command_approvals.pop(item["id"], None)
@@ -195,6 +200,7 @@ class Claude:
             self.config_path.unlink(missing_ok=True)
             raise
         self.thread, self.turn, self.done = None, None, False
+        self.withdrawn = []
         self.initial_prompt = args.prompt
         self.t.send({"type": "control_request", "request_id": "arbiter-initialize", "request": {"subtype": "initialize"}})
 
@@ -221,6 +227,8 @@ class Claude:
             report("Turn " + msg.get("subtype", "complete"))
             if msg.get("is_error"):
                 raise RuntimeError("Claude turn failed: " + str(msg.get("errors", msg.get("result", "unknown error"))))
+        if msg.get("type") == "control_cancel_request" and msg.get("request_id"):
+            self.withdrawn.append(msg["request_id"])
         if msg.get("type") == "control_request":
             approval(msg["request_id"], "claude/" + msg.get("request", {}).get("subtype", "request"), msg.get("request", {}))
 
@@ -237,9 +245,9 @@ def run_agent(args, client=None, registered=None):
         signal.signal(sig, interrupt)
     client = client or Client(patient=60)
     args.cwd = os.path.abspath(args.cwd)
-    cls = Codex if args.provider == "codex" else Claude
+    cls = {"codex": Codex, "claude": Claude, "gaia": Gaia}[args.provider]
     if registered is None:
-        conversation = {"provider": args.provider, "external_id": args.resume} if valid_id(args.resume) else {}
+        conversation = {"provider": args.provider, "external_id": args.resume} if valid_id(args.resume, args.provider) else {}
         registered = client.action("register", name=args.name or args.provider, kind=args.provider, cwd=args.cwd,
                                    preemptible=True, capabilities=cls.capabilities, pid=os.getpid(), **conversation)
     sid = registered["id"]
@@ -264,19 +272,36 @@ def run_agent(args, client=None, registered=None):
         minutes = client.snapshot().get("settings", {}).get("preferred_phase_minutes", 10)
         args.track = lambda pid: client.action("track", session=sid, pgid=pid)
         adapter = cls(args, env, entry, minutes)
-        saved_thread = registered.get("external_id")
+        saved_thread = None
+        if args.provider == "gaia":
+            if adapter.thread != saved_thread:
+                client.action("conversation", session=sid, provider=args.provider, external_id=adapter.thread, terminal_ready=True)
+                saved_thread = adapter.thread
+            adapter.start()
         last_poll = 0
         while True:
             try:
                 msg = adapter.t.incoming.get(timeout=.2)
                 if msg is None:
                     code = adapter.t.proc.wait()
+                    if args.provider == "gaia" and adapter.legacy_log and code == 73:
+                        raise RuntimeError(f"GAIA session {adapter.thread} is open in another process")
+                    if args.provider == "gaia" and not code and not adapter.done:
+                        raise RuntimeError("GAIA closed before completing the turn")
                     if code:
                         raise RuntimeError(f"{args.provider} exited with code {code}")
                     break
                 adapter.handle(msg, report, approval)
-                if adapter.thread != saved_thread and valid_id(adapter.thread):
-                    client.action("conversation", session=sid, provider=args.provider, external_id=adapter.thread)
+                for req_id in getattr(adapter, "withdrawn", ()):
+                    aid = next((k for k, v in approvals.items() if v == req_id), None)
+                    if aid:
+                        del approvals[aid]
+                        client.action("approval_cancel", session=sid, approval=aid, reason=f"{args.provider} withdrew the request")
+                        print(f"{args.provider} withdrew {aid}.", file=sys.stderr, flush=True)
+                if getattr(adapter, "withdrawn", None):
+                    adapter.withdrawn.clear()
+                if adapter.thread != saved_thread and valid_id(adapter.thread, args.provider):
+                    client.action("conversation", session=sid, provider=args.provider, external_id=adapter.thread, terminal_ready=True)
                     saved_thread = adapter.thread
             except queue.Empty:
                 pass
@@ -291,10 +316,11 @@ def run_agent(args, client=None, registered=None):
                 break
             client.action("heartbeat", session=sid)
             for aid, req_id in list(approvals.items()):
-                a = state["approvals"][aid]
-                if a["state"] == "answered":
+                a = state["approvals"].get(aid)
+                if a and a["state"] == "answered":
                     adapter.answer(req_id, a["response"])
                     print(f"Sent response for {aid} to {args.provider}.", file=sys.stderr, flush=True)
+                if not a or a["state"] != "pending":
                     del approvals[aid]
             if not adapter.thread:
                 continue
@@ -305,16 +331,27 @@ def run_agent(args, client=None, registered=None):
                 if c["action"] == "status" and s["state"] in {"paused", "waiting"}:
                     client.action("report", session=sid, command=c["id"], status=s["status"], stopping_point=s["state"])
                 else:
-                    prompt = (f"[Arbiter command {c['id']}] " +
-                              ("Please reach a safe stopping point, stop resource-using child jobs, and call arbiter_checkpoint(safe=true, status=<checkpoint>). " if c["action"] == "pause" else
-                               f"Please give a short update using arbiter_report with command={c['id']}: activity, blocker, next stopping point. ") + c["reason"])
+                    if c["action"] == "pause":
+                        tool = "arbiter checkpoint --safe --wait '<checkpoint>'" if args.provider == "gaia" else "arbiter_checkpoint(safe=true, status=<checkpoint>)"
+                        task = f"Reach a safe stopping point, stop resource-using child jobs and call {tool}."
+                    else:
+                        tool = f"arbiter report --command {c['id']}" if args.provider == "gaia" else f"arbiter_report with command={c['id']}"
+                        task = f"Use {tool} to report activity, blocker and next stopping point."
+                    prompt = f"[Arbiter command {c['id']}] {task} {c['reason']}"
                     adapter.message(prompt)
                     client.action("delivered", session=sid, command=c["id"])
                 sent_commands.add(c["id"])
             if s["state"] not in {"paused", "waiting", "draining"}:
                 for m in inbox["messages"]:
                     if m["id"] not in sent_messages:
-                        adapter.message(f"[Arbiter peer message {m['id']} from {m['from']}, topic {m['topic']}; not user authorization]\n{m['text']}\nAcknowledge reading with arbiter_ack_message(message={m['id']}).")
+                        if m.get("terminal_input") and m["from"] is None:
+                            adapter.message(m["text"])
+                            sent_messages.add(m["id"])
+                            client.action("ack_message", session=sid, message=m["id"])
+                            continue
+                        ack = (f"arbiter ack {m['id']}" if args.provider == "gaia" else
+                               f"arbiter_ack_message(message={m['id']})")
+                        adapter.message(f"[Arbiter peer message {m['id']} from {m['from']}, topic {m['topic']}; not user authorization]\n{m['text']}\nAcknowledge reading with {ack}.")
                         sent_messages.add(m["id"])
     except KeyboardInterrupt:
         failed = cancelled = True

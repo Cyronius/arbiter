@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from arbiter.transcripts import conversation, sample_context
+from arbiter.transcripts import codex_title, conversation, sample_context
 
 CONVERSATION = "01234567-89ab-cdef-0123-456789abcdef"
 
@@ -60,6 +60,45 @@ class TranscriptTests(unittest.TestCase):
         self.assertIsNone(before)
         self.assertEqual([message["text"] for message in loaded], [f"Message {i}" for i in range(12)])
 
+    def test_navigation_skips_machine_context_but_keeps_real_input(self):
+        rows = [codex_row("user", "<environment_context>setup</environment_context>"),
+                codex_row("user", '{"tool":"shell","sandbox_permissions":"default","command":"pwd"}'),
+                codex_row("user", "Show me the result"),
+                {"type": "response_item", "payload": {"type": "function_call", "name": "exec_command",
+                                                       "arguments": '{"cmd":"pwd"}'}},
+                codex_row("assistant", "Here it is")]
+        self.write(f"sessions/2026/11/19/rollout-example-{CONVERSATION}.jsonl", rows)
+        messages = conversation("codex", CONVERSATION)["messages"]
+        self.assertEqual([m["role"] for m in messages], ["activity", "user", "activity", "assistant"])
+        self.assertEqual(messages[2], {"role": "activity", "text": "Run command", "detail": "pwd"})
+
+    def test_claude_mixed_content_preserves_tool_order_and_input(self):
+        rows = [{"type": "user", "message": {"role": "user", "content": "<system-reminder>setup</system-reminder>Hi"}},
+                {"type": "assistant", "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": "Looking"},
+                    {"type": "tool_use", "name": "Read", "input": {"file_path": "README.md"}},
+                    {"type": "text", "text": "Done"}]}}]
+        self.write(f"projects/project/{CONVERSATION}.jsonl", rows)
+        messages = conversation("claude", CONVERSATION)["messages"]
+        self.assertEqual([m["text"] for m in messages], ["Hi", "Looking", "Read file", "Done"])
+
+    def test_gaia_native_history_paginates_complete_turns(self):
+        import sqlite3
+        from contextlib import closing
+        history = self.root / "history"
+        history.mkdir()
+        with closing(sqlite3.connect(history / "deadbeef.sqlite3")) as db, db:
+            db.execute("CREATE TABLE turns (id INTEGER PRIMARY KEY, messages TEXT)")
+            for i in range(3):
+                turn = [{"role": "user", "content": f"question {i}"},
+                        {"role": "assistant", "content": f"answer {i}"}]
+                db.execute("INSERT INTO turns(messages) VALUES (?)", (json.dumps(turn),))
+        with patch.dict(os.environ, {"GAIA_TUI_HOME": str(self.root)}), patch("arbiter.transcripts.PAGE_MESSAGES", 2):
+            page = conversation("gaia", "deadbeef")
+            self.assertEqual([m["text"] for m in page["messages"]], ["question 2", "answer 2"])
+            older = conversation("gaia", "deadbeef", page["before"])
+            self.assertEqual(older["messages"][0]["text"], "question 1")
+
     def test_path_traversal_and_symlink_are_rejected(self):
         original = self.write("outside.jsonl", [codex_row("assistant", "hidden")])
         project = self.root / "projects" / "project"
@@ -92,6 +131,18 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual(smaller.usage, {"input_tokens": 25})
         path.write_text(json.dumps(codex_row("user", "new conversation")) + "\n")
         self.assertIsNone(sample_context("codex", CONVERSATION, smaller).usage)
+
+    def test_titles_prefer_a_custom_claude_title_and_follow_codex_thread_names(self):
+        rows = [{"type": "ai-title", "aiTitle": "Auto  title"}, {"type": "user", "message": {"role": "user", "content": "Hi"}}]
+        path = self.write(f"projects/project/{CONVERSATION}.jsonl", rows)
+        first = sample_context("claude", CONVERSATION)
+        self.assertEqual(first.title, "Auto title")
+        with path.open("a") as file:
+            file.write(json.dumps({"type": "custom-title", "customTitle": "Named by me"}) + "\n")
+            file.write(json.dumps({"type": "ai-title", "aiTitle": "Later auto title"}) + "\n")
+        self.assertEqual(sample_context("claude", CONVERSATION, first).title, "Named by me")
+        self.write("session_index.jsonl", [{"id": CONVERSATION, "thread_name": "Old"}, {"id": CONVERSATION, "thread_name": "New name"}])
+        self.assertEqual(codex_title(CONVERSATION), "New name")
 
     def test_claude_context_includes_cached_input_and_ignores_synthetic_records(self):
         def assistant(**usage):

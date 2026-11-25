@@ -461,6 +461,36 @@ class HookProtocolTests(Base):
         self.hook("SessionEnd", reason="prompt_input_exit")
         self.assertEqual(self.state(me)["state"], "finished")
 
+    def test_permission_prompt_marks_the_session_until_the_call_settles(self):
+        self.hook("SessionStart")
+        me = next(s["id"] for s in self.state()["sessions"].values() if s.get("external_id") == "conv-1")
+        call = {"tool_name": "Bash", "tool_input": {"command": "rm -rf build"}}
+        self.assertIsNone(self.hook("PermissionRequest", **call))
+        note, = self.state(me)["attention"]
+        self.assertEqual((note["kind"], note["detail"]), ("permission", "Bash: rm -rf build"))
+        self.hook("PostToolUse", tool_name="Read", tool_input={"file_path": "/x"})  # a parallel call
+        self.assertTrue(self.state(me).get("attention"))
+        self.hook("PostToolUse", **call)
+        self.assertNotIn("attention", self.state(me))
+        self.hook("PermissionRequest", **call)
+        self.hook("Notification", notification_type="elicitation_dialog", message="MCP server requests your input")
+        self.assertEqual(len(self.state(me)["attention"]), 2)
+        self.hook("Notification", notification_type="idle_prompt", message="waiting")
+        self.assertEqual(len(self.state(me)["attention"]), 2)
+        self.hook("Stop", stop_hook_active=False)
+        self.assertNotIn("attention", self.state(me))
+
+    def test_attention_lapses_and_ends_with_the_session(self):
+        self.hook("SessionStart")
+        me = next(s["id"] for s in self.state()["sessions"].values() if s.get("external_id") == "conv-1")
+        self.hook("PermissionRequest", tool_name="Bash", tool_input={"command": "make"})
+        self.store.state["sessions"][me]["attention"][0]["since"] -= 3601
+        self.store.apply("tick", {})
+        self.assertNotIn("attention", self.state(me))
+        self.hook("PermissionRequest", tool_name="Bash", tool_input={"command": "make"})
+        self.hook("SessionEnd", reason="other")
+        self.assertNotIn("attention", self.state(me))
+
     def test_managed_children_use_their_session_and_skip_relay(self):
         sid = self.register(kind="claude")
         self.assertIsNone(self.hook("PostToolUse", env={"ARBITER_SESSION": sid}, tool_name="Read"))

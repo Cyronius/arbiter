@@ -43,7 +43,7 @@ Codex skips hooks it has not been told to trust: approve them once with `/hooks`
 
 Open [the board](http://127.0.0.1:7483/) and sign in with the Linux account that runs Arbiter. On Omarchy, Arbiter verifies the password through Linux PAM. The browser keeps an HttpOnly session cookie. `arbiter open` also opens the board using a one-time link. To run the daemon in a terminal instead of the service: `arbiter serve`.
 
-Use **Grouping** in Sessions to switch between the flat list, Roster by provider, and Flow by state. Keyword search and quick filters work with every grouping. **Resource wait** selects sessions with queued reservations. **Needs approval** selects sessions with pending approvals.
+Use **Grouping** in Sessions to switch between the flat list, Roster by provider, and Flow by state. Keyword search and quick filters work with every grouping. **Resource wait** selects sessions with queued reservations. **Needs approval** selects sessions with pending approvals, and hooked sessions waiting on a permission prompt or input dialog in their own terminal.
 
 Run `arbiter` to see current status and the board URL. Running `arbiter serve` again prints the existing daemon's address.
 
@@ -70,6 +70,7 @@ With the hooks installed, each Claude Code or Codex conversation is an Arbiter s
 - **The guard.** Before each shell command, the `PreToolUse` hook checks the command: is another session measuring? does another session hold a resource whose `match` pattern this command fits? is the machine under memory or CPU pressure (unless this session already holds resources)? If so, the command is held inside the hook for up to `wait_inline_s` (240 s); if it is still blocked the agent gets `WAIT, not a refusal: gpu is held by … until ~14:20` and an `arbiter wait gpu` command to run in the background before retrying. Light commands (`ls`, `git status`, `grep`, …) and anything already wrapped in `arbiter` pass straight through. An unwrapped command that uses a configured resource gets a one-line nudge to wrap it next time.
 - **Delivery.** Pause and status requests and messages from other sessions are injected into the conversation after tool calls (`PostToolUse`), on the next prompt, at session start, and at `Stop` (which keeps the agent going once to handle them). Messages are acknowledged when delivered.
 - **Pauses.** While a pause is requested, new non-trivial commands are refused with instructions to stop resource-using work and run `arbiter checkpoint --safe '…'`; after the checkpoint they are held until the session is resumed.
+- **Needs you.** The `PermissionRequest` hook (and Claude's `Notification` hook for MCP input dialogs) marks the session on the board and in `arbiter status` while a dialog waits in its terminal. Arbiter only observes: the hook prints nothing and the provider shows its dialog unchanged. The mark clears when that tool call finishes, at the next prompt or `Stop`, when the session ends, or after an hour, since an interrupted dialog fires no hook.
 - **Fail-open.** If the daemon is stopped or unreachable, the hook prints a note on stderr and allows the call.
 
 Inside a session, CLI commands act as that session automatically: `arbiter report`, `arbiter message`, `arbiter checkpoint`, `arbiter inbox`. The `arbiter mcp` server, when configured in a Claude Code/Codex session, also attaches to the same session.
@@ -138,14 +139,23 @@ quiet_timeout_s = 120
 
 ## Managed sessions
 
-`arbiter agent` starts a foreground supervisor that owns a Codex or Claude child, configures Arbiter MCP tools for that child only, streams its output, and stays alive after a completed turn to relay messages and requests. Use `--once` to exit after the first turn, `--resume <provider-id>` to continue a conversation.
+`arbiter agent` starts a foreground supervisor that owns a Codex, Claude or GAIA child, forwards its output, and stays alive after a completed turn to relay messages and requests. Use `--once` to exit after the first turn, `--resume <provider-id>` to continue a conversation.
 
 ```bash
 arbiter agent codex 'Inspect this project and report what you find' --cwd .
 arbiter agent claude 'Inspect this project and report what you find' --cwd .
+arbiter agent gaia 'Inspect this project and report what you find' --cwd . --once
 ```
 
-The routine coordination tools (report, inbox, acknowledge, message, reserve, release, checkpoint) are preapproved for the child only: per-tool overrides for Codex, `--allowedTools` for Claude. `arbiter_finish` and every other tool still ask. Claude's permission prompts reach the board through `--permission-prompt-tool stdio`; answer them there or with:
+GAIA uses its Python flagship agent (`gaiapy` or `gaia-agent`) and the Arbiter CLI for coordination. Tool confirmations appear on the board. Peer messages and pause requests arrive as follow-up turns. The supervisor prints the GAIA conversation ID. Pass the full ID to continue in the same SQLite history:
+
+```bash
+arbiter agent gaia 'Continue from the last completed step' --resume <gaia-conversation-id>
+```
+
+GAIA stores these conversations under `~/.gaia/tui/history/`. Builds with `--session-kind` also list them in the GAIA terminal's `/sessions` picker. Close an open conversation before resuming it elsewhere. If you override `GAIA_TUI_HOME`, use the same directory for the supervisor and daemon so the board can find its transcripts and recover them.
+
+For Codex and Claude, the routine coordination tools (report, inbox, acknowledge, message, reserve, release, checkpoint) are preapproved for the child only: per-tool overrides for Codex, `--allowedTools` for Claude. `arbiter_finish` and every other tool still ask. Claude's permission prompts reach the board through `--permission-prompt-tool stdio`; answer them there or with:
 
 ```bash
 arbiter approvals
@@ -154,13 +164,13 @@ arbiter decline a_0123456789ab
 arbiter answer a_0123456789ab '{"decision":"decline"}'
 ```
 
-These approve or decline one call; they never grant persistent trust. Peer messages never approve actions. A managed child gets a token scoped to its own session (and to job/hold sessions it starts), so a model cannot approve its own prompts through the API.
+These approve or decline one call; they never grant persistent trust. A request closes without an answer when nothing can deliver one: **cancelled** when the provider withdraws it (Codex `serverRequest/resolved`, Claude `control_cancel_request`) or the session ends, **expired** when the supervisor exits while its commands still run. Answering a closed request fails with the reason. Peer messages never approve actions. A managed child gets a token scoped to its own session (and to job/hold sessions it starts), so a model cannot approve its own prompts through the API.
 
 Checkpoints are cooperative, not snapshots of process memory: the worker must stop resource-using child work and call `arbiter_checkpoint`, which releases its bundle, waits without model polling, and returns after resume and reacquisition.
 
 ## Recover a job or conversation
 
-On the Sessions board, choose **Rerun command** for a recorded shell job or **Resume conversation** for a managed Claude or Codex session. Both actions work with the operator model off. Use `arbiter rerun-command SESSION_ID` or `arbiter resume-conversation SESSION_ID` from the CLI. The shorthand `arbiter recover SESSION_ID` selects the action from the stored session kind. Each returns the new attempt ID. Repeating the request against the same predecessor returns the same ID, including after a daemon restart. To recover again, select the latest attempt. The original board row links to it and shows its queue reason or outcome.
+On the Sessions board, choose **Rerun command** for a recorded shell job or **Resume conversation** for a managed Claude, Codex or GAIA session. Both actions work with the operator model off. Use `arbiter rerun-command SESSION_ID` or `arbiter resume-conversation SESSION_ID` from the CLI. The shorthand `arbiter recover SESSION_ID` selects the action from the stored session kind. Each returns the new attempt ID. Repeating the request against the same predecessor returns the same ID, including after a daemon restart. To recover again, select the latest attempt. The original board row links to it and shows its queue reason or outcome.
 
 Use `arbiter run --record` to save an exact argument vector, working directory, resource request and execution options in Arbiter’s owner-only SQLite database. The board and event feed show the public name and label. Choose labels suitable for sharing. A replay runs unattended in the original directory with the daemon’s environment and fresh session credentials. Put credential lookup and environment setup in a named script. Write output and checkpoints to files that the next invocation can read.
 
@@ -189,6 +199,16 @@ arbiter rerun-command "$job"
 After a wrapper dies, Arbiter keeps its reservation while tracked work survives. Once the worker exits, inspect the output and checkpoint files. For an unknown outcome the board asks for confirmation, or use `arbiter recover SESSION_ID --confirm-unknown`. An older shell job needs a recorded launch to rerun. A managed conversation needs its provider GUID, readable local transcript and original directory. Recovery opens one new turn in that conversation. Pi operator calls are ephemeral. A persistent Pi session can be opened separately with `pi --session FULL_ID`.
 
 For repeatable commands, the operator can use `arbiter run --auto-retry` at launch. This records the command and allows two automatic retries across its attempt history. After an observed failure, the delays are 30 seconds and then two minutes. When a delay expires, normal scheduler admission applies. Use **Cancel retry** or `arbiter cancel-retry SESSION_ID` during backoff. Press Ctrl+C in the wrapper to stop a running job deliberately. Deliberate stops, unknown outcomes and confirmed OOM kills require a manual decision. On Linux, the wrapper classifies SIGKILL by checking the current boot’s kernel journal for an OOM victim record matching the command PID and invocation time. Cooperative exit-75 handoffs with `--preemptible --requeue` keep their own count on the same attempt.
+
+When a queued reservation is granted, Arbiter sends an inbox message to its session, or to the parent conversation for a job or hold. The waiting command proceeds automatically. Hook-connected conversations receive the message on their next hook.
+
+### Using a session from a terminal
+
+The board labels managed agents **Headless**. After the supervisor connects to the conversation, **Attach terminal** opens an Arbiter console that shows new reports and sends each line you enter to that agent. Ctrl-D detaches. Approval requests still use the board or `arbiter answer`. You can also run `arbiter attach-terminal SESSION` from a local terminal.
+
+For a finished Codex or Claude session, **Resume in terminal** opens the provider’s interactive UI in the original project directory. The CLI equivalent is `arbiter resume-terminal SESSION`. Arbiter checks local history, surviving work, and active copies of the conversation before claiming a new attempt. Hook-discovered sessions display **Terminal unknown** when their launch mode is unavailable. Board buttons use the machine’s desktop terminal through `xdg-terminal-exec`.
+
+In **View conversation**, use the previous and next arrows to jump between user inputs. Previous can fetch earlier history. Tool activity appears alongside the conversation, with command or path details you can expand.
 
 ## Operator commands
 

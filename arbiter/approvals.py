@@ -6,6 +6,8 @@ def confirmation_response(approval, allow):
     params = approval.get("params", {})
     if method in {"item/commandExecution/requestApproval", "item/fileChange/requestApproval"}:
         return {"decision": "accept" if allow else "decline"}
+    if method == "gaia/needs_confirmation":
+        return {"decision": "allow" if allow else "deny"}
     if method == "claude/can_use_tool":
         return {"behavior": "allow", "updatedInput": params.get("input", {})} if allow else {
             "behavior": "deny", "message": "Denied from Arbiter"}

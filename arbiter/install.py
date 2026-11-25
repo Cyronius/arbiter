@@ -171,6 +171,9 @@ def table(provider: str) -> dict:
         "PreToolUse": group(300, shell_matcher),
         "PostToolUse": group(15, "*"),
         "Stop": group(15),
+        # Advisory "needs you" state; kept short so a slow daemon never delays the dialog.
+        "PermissionRequest": group(5, "*"),
+        **({"Notification": group(5)} if provider == "claude" else {}),
         # Codex caps SessionEnd hooks at 3 seconds.
         "SessionEnd": group(10 if provider == "claude" else 3),
     }

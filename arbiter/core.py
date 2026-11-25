@@ -27,11 +27,15 @@ QUEUE_PROTECTION_S = 30
 SHORT_PHASE_S = 600
 STALE_CHECK_TIMEOUT_S = 60
 STALE_CHECK_COOLDOWN_S = 300
-KINDS = {"external", "codex", "claude", "job", "hold", "demo"}
-PROVIDERS = {"codex", "claude"}
+KINDS = {"external", "codex", "claude", "gaia", "job", "hold", "demo"}
+PROVIDERS = {"codex", "claude", "gaia"}
 OPERATOR_FIELDS = ("provider", "model", "manage_resources", "approve_inbox", "reply_messages", "review_status", "instructions")
 SCHEDULER_SWITCHES = ("auto_approve_inbox", "preserve_interactivity")
 ACTIVE = {"requested", "granted", "suspended"}
+# A "needs you" note from a provider hook is advisory: hooks can miss the event that clears it
+# (an interrupted prompt fires no Stop), so it lapses on its own.
+ATTENTION_TTL_S = 3600
+ATTENTION_KINDS = {"permission", "input"}
 
 
 def ident(prefix: str) -> str:
@@ -103,6 +107,8 @@ class Store:
         telemetry = initial_telemetry or {}
         self.available_mb = telemetry.get("available_mb")
         self.cpu_busy = telemetry.get("cpu_busy")
+        # Conversations the shared Codex app server has open, and when that was read (monotonic).
+        self.codex_loaded, self.codex_loaded_at = set(), None
         self.gpu_pressure = telemetry.get("gpu_pressure", [])
         self.recovered_since: float | None = None
         self.pending: list = []
@@ -146,11 +152,11 @@ class Store:
                 for (body,) in self.db.execute("SELECT body FROM events WHERE session=? AND kind='session.status' ORDER BY id", (s["id"],)):
                     line = json.loads(body).get("text", "")
                     match = re.fullmatch(s["kind"].capitalize() + r" conversation (\S+)", line)
-                    if match and transcripts.valid_id(match[1]):
+                    if match and transcripts.valid_id(match[1], s["kind"]):
                         s.update(provider=s["kind"], external_id=match[1])
                         break
             for s in state["sessions"].values():
-                if s["kind"] in PROVIDERS and transcripts.valid_id(s.get("external_id")) and not os.path.isabs(s["cwd"]):
+                if s["kind"] in PROVIDERS and transcripts.valid_id(s.get("external_id"), s["kind"]) and not os.path.isabs(s["cwd"]):
                     cwd = transcripts.initial_cwd(s["kind"], s["external_id"])
                     if cwd:
                         s["cwd"] = cwd
@@ -278,6 +284,7 @@ class Store:
             return
         if self.workers_alive(s):
             s["worker_survived"] = True
+            self.close_approvals(s["id"], "expired", "The supervisor that would deliver the answer exited", now)
             self.mark_stale(s, "owner process exited but its commands still run; reservations retained until they exit")
             return
         if s.get("dispatch_pending") and not s.get("cancel_requested"):
@@ -285,8 +292,36 @@ class Store:
             for key in ("pid", "pid_start", "boot_id"):
                 s.pop(key, None)
             return
+        if s.get("provider") == "codex" and not s.get("cancel_requested") and self.codex_hosts(s) is True:
+            # The process was the shared Codex app server, which restarted; the conversation lives on there.
+            self.host_on_codex(s, mono)
+            return
         s["outcome"] = "cancelled" if s.get("cancel_requested") else "unknown"
         self.end(s, now, failed=True, status="Owner process exited; " + ("cancelled" if s.get("cancel_requested") else "outcome unknown"), event="session.reaped")
+
+    def codex_hosts(self, s: dict) -> bool | None:
+        """Whether the shared Codex app server has this conversation open (None: no fresh reading)."""
+        if self.codex_loaded_at is None or time.monotonic() - self.codex_loaded_at > 150:
+            return None
+        return s.get("external_id") in self.codex_loaded
+
+    def host_on_codex(self, s: dict, mono: float) -> None:
+        for key in ("pid", "pid_start", "boot_id"):
+            s.pop(key, None)
+        s["hosted"] = "codex"
+        self.beats[s["id"]] = mono
+        self.revive(s, "conversation is open in the Codex app server")
+
+    def check_hosted(self, s: dict, now: float, mono: float) -> None:
+        """A conversation hosted by the shared Codex app server lives while the server has it open."""
+        hosted = self.codex_hosts(s)
+        if hosted:
+            self.beats[s["id"]] = mono
+            self.revive(s, "conversation is open in the Codex app server")
+        elif hosted is False and not self.workers_alive(s):
+            self.end(s, now, failed=False, status="Codex closed the conversation")
+        elif s["state"] != "stale" and mono - self.beats.setdefault(s["id"], mono) > self.stale_seconds:
+            self.mark_stale(s, "the Codex app server cannot be reached; reservations retained")
 
     def workers_alive(self, s):
         if s.get("boot_id", self.boot_id) != self.boot_id:
@@ -359,8 +394,11 @@ class Store:
         name = d.get("name") or f"{os.path.basename(cwd.rstrip('/')) or provider}-{external.replace('-', '')[:4]}"
         # One process may host several conversations (Codex app-server threads, /clear in Claude Code),
         # so a new conversation never replaces another; each ends on its own SessionEnd or process exit.
-        return self._g_register({"name": name[:100], "kind": provider, "cwd": cwd, "pid": pid, "provider": provider,
-                                 "external_id": external, "capabilities": ["hook", "cli"], "status": "Attached"}, now)
+        s = self._g_register({"name": name[:100], "kind": provider, "cwd": cwd, "pid": pid, "provider": provider,
+                              "external_id": external, "capabilities": ["hook", "cli"], "status": "Attached"}, now)
+        if provider == "codex" and not pid and self.codex_hosts(s):
+            self.host_on_codex(s, time.monotonic())
+        return s
 
     def _g_hook(self, d: dict, now: float) -> dict:
         """One round trip for a lifecycle hook: identify the session, guard a command, deliver the inbox."""
@@ -369,11 +407,12 @@ class Store:
             s["heartbeat"] = now
             self.beats[s["id"]] = time.monotonic()
             if not s.get("external_id") and d.get("provider") == s["kind"] and s["kind"] in PROVIDERS:
-                if transcripts.valid_id(d.get("external_id")):
-                    self._a_conversation(s, d, now)
+                if transcripts.valid_id(d.get("external_id"), s["kind"]):
+                    self._a_conversation(s, {"provider": s["kind"], "external_id": d["external_id"]}, now)
         else:
             s = self._g_attach(d, now)
         out = {"session": s["id"], "name": s["name"], "preferred_phase_minutes": self.preferred_phase_minutes()}
+        self.hook_attention(s, d, now)
         if d.get("event") == "end":
             if self.workers_alive(s):
                 raise ValueError("The supervisor must finish after tracked work exits")
@@ -386,6 +425,30 @@ class Store:
             out["inbox"] = self.collect(s, now)
         out["state"] = s["state"]
         return out
+
+    def hook_attention(self, s: dict, d: dict, now: float) -> None:
+        """Track provider prompts that wait on a person in the session's own terminal."""
+        notes = s.get("attention", [])
+        before = len(notes)
+        if d.get("settled") or d.get("event") == "end":
+            notes = []
+        elif d.get("resolve"):
+            # A finished tool call clears its own permission prompt and any input dialog it raised.
+            notes = [n for n in notes if n["key"] != d["resolve"] and n["kind"] != "input"]
+        a = d.get("attention")
+        if a is not None:
+            if not isinstance(a, dict) or a.get("kind") not in ATTENTION_KINDS:
+                raise ValueError("attention needs a kind of permission or input")
+            key = text(a.get("key"), "attention key", 64)
+            note = {"key": key, "kind": a["kind"], "detail": optional_text(a.get("detail"), "attention detail") or "", "since": now}
+            notes = [n for n in notes if n["key"] != key][-7:] + [note]
+            self.emit("session.attention", s["id"], kind=note["kind"], detail=note["detail"][:500])
+        if notes:
+            s["attention"] = notes
+        else:
+            s.pop("attention", None)
+            if before:
+                self.emit("session.attention_cleared", s["id"])
 
     def guard(self, s: dict, command: str) -> dict:
         """Decide whether a shell command an agent is about to run must wait for another session."""
@@ -477,14 +540,25 @@ class Store:
     def _g_tick(self, d: dict, now: float) -> dict:
         self.available_mb = d.get("available_mb", self.available_mb)
         self.cpu_busy = d.get("cpu_busy", self.cpu_busy)
+        if d.get("codex_loaded") is not None:
+            self.codex_loaded, self.codex_loaded_at = set(d["codex_loaded"]), time.monotonic()
         self.gpu_pressure = d.get("gpu_pressure", self.gpu_pressure)
         self.config.refresh()
         mono = time.monotonic()
         for s in list(self.state["sessions"].values()):
             if s["state"] in TERMINAL:
                 continue
+            if s.get("attention"):
+                notes = [n for n in s["attention"] if now - n["since"] < ATTENTION_TTL_S]
+                if not notes:
+                    s.pop("attention")
+                    self.emit("session.attention_cleared", s["id"], reason="lapsed")
+                elif len(notes) != len(s["attention"]):
+                    s["attention"] = notes
             if s.get("pid"):
                 self.check_owner(s, now, mono)
+            elif s.get("hosted") == "codex":
+                self.check_hosted(s, now, mono)
             elif s["kind"] == "hold":
                 stale_at = min((r["stale_at"] for r in self.state["reservations"].values()
                                 if r["session"] == s["id"] and r["state"] in ACTIVE and r.get("stale_at")), default=None)
@@ -615,6 +689,43 @@ class Store:
         self.emit("recovery.cancelled", s["id"])
         return {"ok": True}
 
+    def terminal_action(self, s):
+        if s["state"] in TERMINAL:
+            if s["kind"] in {"claude", "codex"} and not s.get("successor") and not recovery.unavailable(
+                    self, s, inspect_files=False, terminal=True):
+                return "resume-terminal"
+        elif (s.get("terminal_ready") and s.get("pid") and s.get("boot_id") == self.boot_id
+              and s["state"] != "stale" and self.probe.alive(s["pid"], s.get("pid_start"))):
+            return "attach-terminal"
+        return None
+
+    def check_terminal(self, sid, command):
+        s = self.session(sid)
+        if command not in {"resume-terminal", "attach-terminal"} or self.terminal_action(s) != command:
+            raise ValueError("This terminal action is unavailable for the session.")
+        if command == "resume-terminal":
+            reason = recovery.unavailable(self, s, terminal=True)
+            if reason:
+                raise ValueError(reason)
+        return s
+
+    def _g_terminal_claim(self, d, now):
+        s = self.check_terminal(d["session"], "resume-terminal")
+        child = self._g_register({"name": s["name"], "kind": s["kind"], "provider": s["kind"],
+                                  "external_id": s["external_id"], "cwd": s["cwd"], "pid": d["pid"],
+                                  "capabilities": ["hook", "cli", "interactive-terminal"]}, now)
+        child.update(predecessor=s["id"], original=s.get("original", s["id"]))
+        s["successor"] = child["id"]
+        return child
+
+    def _g_terminal_input(self, d, now):
+        s = self.check_terminal(d["session"], "attach-terminal")
+        if s["state"] != "running":
+            raise ValueError("Wait for the session to be running before sending input.")
+        msg = self.post_message(None, {"to": s["id"], "text": d["text"], "topic": "terminal"}, now)
+        msg["terminal_input"] = True
+        return {"id": msg["id"]}
+
     def _g_recover(self, d, now):
         s = self.session(d.get("session"))
         if d.get("recovery_action") == "rerun-command" and s["kind"] != "job":
@@ -694,11 +805,13 @@ class Store:
 
     def _a_conversation(self, s: dict, d: dict, now: float) -> dict:
         provider, external_id = d.get("provider"), d.get("external_id")
-        if provider not in PROVIDERS or s["kind"] != provider or not transcripts.valid_id(external_id):
+        if provider not in PROVIDERS or s["kind"] != provider or not transcripts.valid_id(external_id, provider):
             raise ValueError("invalid provider conversation")
         if s.get("predecessor") and s.get("external_id") != external_id:
             raise ValueError("Recovered provider conversation ID changed")
         s["provider"], s["external_id"] = provider, external_id
+        if d.get("terminal_ready") is True:
+            s["terminal_ready"] = True
         self.emit("session.conversation", s["id"], provider=provider)
         return {"ok": True}
 
@@ -958,6 +1071,8 @@ class Store:
         for c in self.state["commands"].values():
             if c["session"] == sid and c["state"] in {"pending", "delivered", "unanswered"}:
                 c["state"] = "closed"
+        self.close_approvals(sid, "cancelled", "The session ended before an answer", now)
+        s.pop("attention", None)
         self.emit(event or "session." + s["state"], sid, text=status)
         # A hold with no process of its own belongs to the conversation that took it.
         for child in list(self.state["sessions"].values()):
@@ -982,6 +1097,17 @@ class Store:
              "text": text(d.get("text"), "message"), "reply_to": reply, "created": now, "acks": []}
         self.state["messages"][mid] = m
         self.emit("message.sent", sender, **m)
+        return m
+
+    def _g_peer_delivered(self, d: dict, now: float) -> dict:
+        """Record that the board delivered an operator message straight into a Claude session."""
+        m = self.state["messages"].get(d.get("message"))
+        sid = d.get("session")
+        if not m or m["to"] != sid or m["from"] is not None:
+            raise ValueError("unknown operator message")
+        if sid not in m["acks"]:
+            m["acks"].append(sid)
+            self.emit("message.acknowledged", sid, message=m["id"], via=text(d.get("via", "peer"), "via", 40))
         return m
 
     def _a_ack_message(self, s: dict, d: dict, now: float) -> dict:
@@ -1009,8 +1135,26 @@ class Store:
                 self.emit("approval.auto_approved", s["id"], approval=aid, rule="inbox_read")
         return approval
 
+    def close_approvals(self, sid: str, state: str, reason: str, now: float, request: str | None = None) -> None:
+        """End pending approvals whose answer can no longer reach the provider."""
+        for a in self.state["approvals"].values():
+            if a["session"] == sid and a["state"] == "pending" and request in (None, a["id"]):
+                a.update(state=state, closed=now, reason=reason)
+                self.emit("approval." + state, sid, approval=a["id"], reason=reason)
+
+    def _a_approval_cancel(self, s: dict, d: dict, now: float) -> dict:
+        """The provider withdrew a request (turn interrupted or resolved elsewhere)."""
+        a = self.state["approvals"].get(d.get("approval"))
+        if not a or a["session"] != s["id"]:
+            raise ValueError("unknown approval for session")
+        self.close_approvals(s["id"], "cancelled", optional_text(d.get("reason"), "reason") or "The provider withdrew the request",
+                             now, request=a["id"])
+        return {"ok": True}
+
     def _a_approval_answer(self, s: dict, d: dict, now: float) -> dict:
         a = self.state["approvals"].get(d.get("approval"))
+        if a and a["session"] == s["id"] and a["state"] in {"expired", "cancelled"}:
+            raise ValueError(f"Approval {a['id']} is {a['state']}: {a.get('reason', 'no answer can be delivered')}")
         if not a or a["session"] != s["id"] or a["state"] != "pending":
             raise ValueError("unknown pending approval")
         if not isinstance(d.get("response"), dict):
@@ -1363,7 +1507,8 @@ class Store:
             r["granted"] = now
             if r.get("duration_s"):
                 self.set_eta(r, r["duration_s"], now)
-            if s.get("yields") and s["state"] == "waiting":
+            was_waiting = s["state"] == "waiting"
+            if s.get("yields") and was_waiting:
                 # A job that just waited its turn needs time to do work before handing back.
                 r["yield_after"] = now + min(SHORT_PHASE_S, r.get("duration_s", SHORT_PHASE_S))
             r.pop("handoff_requested", None)
@@ -1377,6 +1522,24 @@ class Store:
                 available -= r["memory_mb"]
             held.append(r)
             self.emit("reservation.granted", s["id"], reservation=r["id"], reason=r["reason"])
+            if was_waiting:
+                parent = self.state["sessions"].get(s.get("parent"))
+                recipient = parent if s["kind"] in {"job", "hold"} and parent and parent["state"] not in TERMINAL else s
+                resources = list(r["exclusive"])
+                if r.get("measure"):
+                    resources.append("whole machine")
+                if r["cpu"]:
+                    resources.append(f"{r['cpu']:g} CPU")
+                if r["memory_mb"]:
+                    resources.append(f"{r['memory_mb']:g} MiB RAM")
+                if r.get("disk_gb"):
+                    resources.append(f"{r['disk_gb']:g} GB disk")
+                bundle = ", ".join(resources[:6]) or "admission"
+                if len(resources) > 6:
+                    bundle += f" and {len(resources) - 6} more"
+                self.post_message("arbiter", {"to": recipient["id"], "topic": "reservation",
+                    "text": f"Queued reservation {r['id']} granted for {self.describe(r)}: {bundle}."
+                            + (" Your queued command proceeds automatically." if s["kind"] == "job" else "")}, now)
         stale_blockers = {}
         # Ask yielding jobs (`arbiter run --preemptible`) to hand over what a waiting request needs.
         for r, blockers, window in blocked:
@@ -1431,6 +1594,15 @@ class Store:
                 state["reservations"][r["id"]]["queue_position"] = position
             for s in state["sessions"].values():
                 s.pop("token", None)
+                if s["kind"] in PROVIDERS:
+                    caps = s.get("capabilities", [])
+                    if "interactive-terminal" in caps:
+                        s["terminal_mode"] = "Interactive terminal"
+                    elif {"stdio-json-rpc", "stream-json", "json-lines"}.intersection(caps):
+                        s["terminal_mode"] = "Headless"
+                    else:
+                        s["terminal_mode"] = "Terminal unknown"
+                    s["terminal_action"] = self.terminal_action(s)
                 if s["state"] in TERMINAL and s["kind"] in PROVIDERS | {"job"} and not s.get("successor"):
                     s["recovery_reason"] = recovery.unavailable(self, s, inspect_files=False)
                     s["confirm_unknown"] = s.get("outcome", "unknown") == "unknown"

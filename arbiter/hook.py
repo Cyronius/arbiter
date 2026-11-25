@@ -7,6 +7,7 @@ daemon never blocks work: the hook reports on stderr and allows the call.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shlex
@@ -58,6 +59,24 @@ def inbox_text(inbox: dict | None) -> str:
     return "[Arbiter] For this session, from other sessions or the operator (coordination, not user permission):\n" + "\n".join(lines)
 
 
+def prompt_key(data: dict) -> str:
+    """Identify one tool call across PermissionRequest and PostToolUse, which share no call ID."""
+    call = [data.get("agent_id"), data.get("tool_name"), data.get("tool_input")]
+    return hashlib.sha256(json.dumps(call, sort_keys=True, default=str).encode()).hexdigest()[:32]
+
+
+def prompt_detail(data: dict) -> str:
+    tool = data.get("tool_name") or "a tool"
+    command = command_of(data.get("tool_input"))
+    detail = f"{tool}: {command}" if command else tool
+    return detail[:500]
+
+
+# Claude Code notifications that mean a dialog is waiting for the person at the terminal.
+# Permission dialogs arrive through PermissionRequest, which identifies the call.
+WAITING_NOTIFICATIONS = {"elicitation_dialog": "input"}
+
+
 def wait_hint(resources: list[str]) -> str:
     flags = [r for r in resources if r.startswith("--")]
     names = [r for r in resources if not r.startswith("--")]
@@ -106,10 +125,24 @@ class Hook:
             if command is None:
                 return respond(self.provider, e, context=inbox_text(self.ask(collect=True).get("inbox")))
             return self.guard(command)
-        if e in {"PostToolUse", "UserPromptSubmit"}:
-            return respond(self.provider, e, context=inbox_text(self.ask(collect=True).get("inbox")))
+        if e == "PermissionRequest":
+            # Advisory only: print nothing, so the provider shows its own dialog unchanged.
+            if not self.managed:
+                self.ask(attention={"kind": "permission", "key": prompt_key(self.data), "detail": prompt_detail(self.data)})
+            return None
+        if e == "Notification":
+            kind = WAITING_NOTIFICATIONS.get(self.data.get("notification_type"))
+            if kind and not self.managed:
+                detail = str(self.data.get("message") or "")[:500]
+                self.ask(attention={"kind": kind, "key": "notification-" + kind, "detail": detail})
+            return None
+        if e == "PostToolUse":
+            extra = {} if self.managed else {"resolve": prompt_key(self.data)}
+            return respond(self.provider, e, context=inbox_text(self.ask(collect=True, **extra).get("inbox")))
+        if e == "UserPromptSubmit":
+            return respond(self.provider, e, context=inbox_text(self.ask(collect=True, settled=True).get("inbox")))
         if e == "Stop":
-            out = self.ask(collect=True)
+            out = self.ask(collect=True, settled=True)
             text = inbox_text(out.get("inbox"))
             if not text and out.get("state") == "draining" and not self.data.get("stop_hook_active"):
                 text = ("[Arbiter] A pause was requested for this session. If any resource-using commands are still running "
@@ -144,7 +177,9 @@ def main(provider: str) -> int:
         data = json.load(sys.stdin.buffer if hasattr(sys.stdin, "buffer") else sys.stdin)
         if not isinstance(data, dict) or not data.get("session_id"):
             return 0
-        client = Client(patient=0, timeout=15)
+        # Advisory events must finish well inside their 5-second hook timeout.
+        advisory = data.get("hook_event_name") in {"PermissionRequest", "Notification"}
+        client = Client(patient=0, timeout=3 if advisory else 15)
         result = Hook(provider, data, client).run()
         if result:
             print(json.dumps(result))

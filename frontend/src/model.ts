@@ -6,6 +6,8 @@ export interface Session {
   status?: string;
   stale_reason?: string;
   worker_survived?: boolean;
+  terminal_mode?: string;
+  terminal_action?: 'resume-terminal' | 'attach-terminal';
   recovery_reason?: string | null;
   confirm_unknown?: boolean;
   successor?: string;
@@ -24,6 +26,8 @@ export interface Session {
   provider?: string;
   external_id?: string;
   context_usage?: {input_tokens: number; window_tokens?: number};
+  title?: string;
+  attention?: {key: string; kind: 'permission' | 'input'; detail: string; since: number}[];
 }
 
 export interface Reservation {
@@ -51,6 +55,7 @@ export interface Message {
   text: string;
   topic?: string;
   reply_to?: string;
+  acks?: string[];
 }
 
 export interface Approval {
@@ -58,6 +63,8 @@ export interface Approval {
   session: string;
   method: string;
   state: string;
+  reason?: string;
+  closed?: number;
   params?: {
     input?: Record<string, unknown>;
     command?: unknown;
@@ -65,6 +72,7 @@ export interface Approval {
     reason?: string;
     message?: string;
     mode?: string;
+    summary?: string;
     requestedSchema?: {type?: string; properties?: Record<string, unknown>; required?: string[]};
   };
 }
@@ -133,6 +141,7 @@ export function confirmationResponse(approval: Pick<Approval, 'method' | 'params
   if (['item/commandExecution/requestApproval', 'item/fileChange/requestApproval'].includes(method)) {
     return {decision: allow ? 'accept' : 'decline'};
   }
+  if (method === 'gaia/needs_confirmation') return {decision: allow ? 'allow' : 'deny'};
   if (method === 'claude/can_use_tool') {
     return allow ? {behavior: 'allow', updatedInput: params.input || {}} : {behavior: 'deny', message: 'Denied from Arbiter'};
   }

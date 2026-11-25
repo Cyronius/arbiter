@@ -25,25 +25,23 @@ def validate_record(record):
     return {"argv": argv, "bundle": {"exclusive": [], "cpu": 0, "memory_mb": 0, **bundle}, **{key: record.get(key) is True for key in OPTIONS}}
 
 
-def unavailable(store, s, *, inspect_files=True):
+def unavailable(store, s, *, inspect_files=True, terminal=False):
     if s["state"] not in {"finished", "failed"}:
         return s.get("stale_reason") or "The attempt is still active."
     if s["kind"] == "job":
         if not s.get("recorded"):
             return "No launch record. The display label cannot replay a command."
-    elif s["kind"] in {"claude", "codex"}:
-        if not {"resume-thread", "resume-session"}.intersection(s["capabilities"]):
+    elif s["kind"] in {"claude", "codex", "gaia"}:
+        if not terminal and not {"resume-thread", "resume-session"}.intersection(s["capabilities"]):
             return "This conversation has no managed adapter registration."
         guid = s.get("external_id")
-        if not transcripts.valid_id(guid):
+        if not transcripts.valid_id(guid, s["kind"]):
             return "The provider conversation GUID is missing or invalid."
         if any(other["state"] not in {"finished", "failed"} and other.get("external_id") == guid
                and other["kind"] == s["kind"] for other in store.state["sessions"].values()):
             return "This provider conversation already has an active session."
-        if inspect_files:
-            with transcripts.open_transcript(s["kind"], guid) as file:
-                if file is None:
-                    return "The local provider transcript is missing or unreadable."
+        if inspect_files and not transcripts.can_resume(s["kind"], guid):
+            return "The local provider transcript is missing or unreadable."
     else:
         return "This session has no managed recovery adapter."
     if inspect_files and store.workers_alive(s):

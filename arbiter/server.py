@@ -16,7 +16,7 @@ from pathlib import Path
 from tempfile import mkstemp
 from urllib.parse import parse_qs, urlsplit
 
-from . import operator, recovery, system, transcripts
+from . import codex_app, operator, peer, recovery, system, terminal, transcripts
 from .client import Client, board_location, read_connection, state_dir
 from .config import Config
 from .core import PROVIDERS, TERMINAL, Store
@@ -34,7 +34,7 @@ else:
 # Everything a session-scoped token may do, and only to its own session. A session token may
 # also register child job/hold sessions under itself (see `permitted`).
 SESSION_ACTIONS = {"heartbeat", "report", "reserve", "release", "checkpoint", "delivered", "finish",
-                   "message", "ack_message", "approval_request", "track", "extend", "requeue", "handoff", "hook", "adopt", "cancelling"}
+                   "message", "ack_message", "approval_request", "approval_cancel", "track", "extend", "requeue", "handoff", "hook", "adopt", "cancelling"}
 # What a session may do to the job and hold sessions it registered (e.g. `arbiter release gpu`).
 CHILD_ACTIONS = {"finish", "extend", "report"}
 
@@ -84,8 +84,9 @@ class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = not system.WINDOWS
 
-    def __init__(self, address, store, token):
+    def __init__(self, address, store, token, allowed_hosts=()):
         self.store, self.token = store, token
+        self.allowed_hosts = {h.lower().rstrip(".") for h in allowed_hosts}
         self.launcher = Launcher()
         self.login_lock = threading.Lock()
         self.next_login = 0
@@ -122,7 +123,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.server.unix:
             return self.headers.get("Host") == "localhost"
         port = self.server.server_port
-        return self.headers.get("Host") in {f"127.0.0.1:{port}", f"localhost:{port}"}
+        names = {"127.0.0.1", "localhost", *getattr(self.server, "allowed_hosts", ())}
+        return self.headers.get("Host") in {f"{name}:{port}" for name in names}
 
     def principal(self):
         """Return "operator", a session ID (session-scoped token), or None."""
@@ -210,6 +212,9 @@ class Handler(BaseHTTPRequestHandler):
                 sample = samples.get((session.get("provider"), session.get("external_id")))
                 if sample and sample.usage is not None and session["state"] not in TERMINAL:
                     session["context_usage"] = sample.usage
+                title = sample and sample.title or session.get("provider") == "codex" and transcripts.codex_title(session.get("external_id"))
+                if title and title != session["name"]:
+                    session["title"] = title
             state["telemetry"] = self.server.telemetry
             state["conversation_viewer"] = who == "operator"
             if who != "operator":
@@ -315,13 +320,25 @@ class Handler(BaseHTTPRequestHandler):
             action = d.get("action")
             if length > 65536 and action != "save_settings":
                 raise ValueError("body must be 1–65536 bytes")
-            if not isinstance(action, str) or action in {"reconcile", "tick", "operator_decision", "operator_events_reviewed", "dispatch", "auto_recover", "retry_blocked"}:
+            if not isinstance(action, str) or action in {"reconcile", "tick", "operator_decision", "operator_events_reviewed", "dispatch", "auto_recover", "retry_blocked", "peer_delivered"}:
                 raise ValueError("internal action")
             if who != "operator":
                 refusal = permitted(who, action, d.get("data", {}), self.server.store)
                 if refusal:
                     return self.response(403, {"error": refusal})
+            if action == "open_terminal":
+                data = d.get("data", {})
+                command = data.get("command")
+                with self.server.store.lock:
+                    session = self.server.store.check_terminal(data.get("session"), command)
+                try:
+                    terminal.open_window(command, session["id"])
+                except OSError as exc:
+                    raise ValueError(str(exc)) from exc
+                return self.response(200, {"ok": True})
             result = self.server.store.apply(action, d.get("data", {}))
+            if action == "operator_message" and who == "operator":
+                result = deliver_to_peer(self.server.store, result)
             return self.response(200, result)
         except (ValueError, TypeError, KeyError) as e:
             return self.response(400, {"error": str(e)})
@@ -366,6 +383,30 @@ class Handler(BaseHTTPRequestHandler):
             return 503, "Linux sign-in is unavailable on this machine."
         finally:
             self.server.next_login = time.monotonic() + 5
+
+
+def deliver_to_peer(store, message):
+    """Hand an operator message to a live Claude session through its own inbox socket, when it has one.
+
+    The hook inbox stays the fallback: a session that cannot be reached here still gets
+    the message at its next tool call or turn."""
+    with store.lock:
+        s = store.state["sessions"].get(message.get("to") or "")
+        live = s and s["state"] not in TERMINAL and s.get("external_id")
+        provider = s.get("provider") if live else None
+        pid, conversation = (s.get("pid"), s["external_id"]) if live else (None, None)
+    try:
+        if provider == "claude" and pid:
+            peer.send(pid, conversation, message["text"])
+            via = "peer"
+        elif provider == "codex":
+            via = "codex-" + codex_app.deliver(conversation, message["text"])
+        else:
+            return message
+    except (peer.PeerUnavailable, codex_app.CodexUnavailable) as exc:
+        return dict(message, delivery={"via": "inbox", "reason": str(exc)})
+    delivered = store.apply("peer_delivered", {"message": message["id"], "session": message["to"], "via": via})
+    return dict(delivered, delivery={"via": via})
 
 
 def refresh_context(server):
@@ -471,7 +512,7 @@ def serve_locked(args, directory):
         except FileNotFoundError:
             pass
     try:
-        server = Server(address, store, token)
+        server = Server(address, store, token, getattr(args, "allow_host", None) or ())
     except BaseException:
         store.db.close()
         raise
@@ -480,14 +521,23 @@ def serve_locked(args, directory):
 
     def monitor():
         children = []
+        ticks = 0
         while not server.stopping.wait(3):
+            codex_loaded = None
+            if ticks % 20 == 0:  # every 60 s: enough to notice a restart or a closed conversation
+                try:
+                    with codex_app.Connection(timeout=3) as conn:
+                        codex_loaded = sorted(codex_app.loaded_threads(conn))
+                except codex_app.CodexUnavailable:
+                    pass
+            ticks += 1
             server.telemetry = system_memory()
             busy = meter.sample()
             server.telemetry["cpu_busy"] = busy
             gpu_pressure = system.gpu_pressure()
             try:
                 store.apply("tick", {"available_mb": server.telemetry.get("available_mb"), "cpu_busy": busy,
-                                     "gpu_pressure": gpu_pressure})
+                                     "gpu_pressure": gpu_pressure, "codex_loaded": codex_loaded})
                 recovery.dispatch(store, url, children)
             except Exception as e:  # never let one bad tick stop liveness checks
                 traceback.print_exception(e, file=sys.stderr)

@@ -1,0 +1,213 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-20T18:23:57+00:00",
+  "title": "Design System for Arbiter",
+  "extensions": {
+    "colorMeta": {
+      "primary": {
+        "role": "primary",
+        "displayName": "Action accent",
+        "tonalRamp": [
+          "oklch(15% 0.0801 219.5)",
+          "oklch(26% 0.0801 219.5)",
+          "oklch(37% 0.0801 219.5)",
+          "oklch(49% 0.0801 219.5)",
+          "oklch(60% 0.0801 219.5)",
+          "oklch(72% 0.0801 219.5)",
+          "oklch(83% 0.0801 219.5)",
+          "oklch(95% 0.0801 219.5)"
+        ]
+      },
+      "on-primary": {
+        "role": "neutral",
+        "displayName": "Action text",
+        "tonalRamp": [
+          "oklch(15% 0.0418 244.7)",
+          "oklch(26% 0.0418 244.7)",
+          "oklch(37% 0.0418 244.7)",
+          "oklch(49% 0.0418 244.7)",
+          "oklch(60% 0.0418 244.7)",
+          "oklch(72% 0.0418 244.7)",
+          "oklch(83% 0.0418 244.7)",
+          "oklch(95% 0.0418 244.7)"
+        ]
+      },
+      "canvas": {
+        "role": "neutral",
+        "displayName": "Canvas",
+        "tonalRamp": [
+          "oklch(15% 0.0327 258.3)",
+          "oklch(26% 0.0327 258.3)",
+          "oklch(37% 0.0327 258.3)",
+          "oklch(49% 0.0327 258.3)",
+          "oklch(60% 0.0327 258.3)",
+          "oklch(72% 0.0327 258.3)",
+          "oklch(83% 0.0327 258.3)",
+          "oklch(95% 0.0327 258.3)"
+        ]
+      },
+      "surface": {
+        "role": "neutral",
+        "displayName": "Panel surface",
+        "tonalRamp": [
+          "oklch(15% 0.0395 257.8)",
+          "oklch(26% 0.0395 257.8)",
+          "oklch(37% 0.0395 257.8)",
+          "oklch(49% 0.0395 257.8)",
+          "oklch(60% 0.0395 257.8)",
+          "oklch(72% 0.0395 257.8)",
+          "oklch(83% 0.0395 257.8)",
+          "oklch(95% 0.0395 257.8)"
+        ]
+      },
+      "surface-alt": {
+        "role": "neutral",
+        "displayName": "Alternate surface",
+        "tonalRamp": [
+          "oklch(15% 0.0488 254.7)",
+          "oklch(26% 0.0488 254.7)",
+          "oklch(37% 0.0488 254.7)",
+          "oklch(49% 0.0488 254.7)",
+          "oklch(60% 0.0488 254.7)",
+          "oklch(72% 0.0488 254.7)",
+          "oklch(83% 0.0488 254.7)",
+          "oklch(95% 0.0488 254.7)"
+        ]
+      },
+      "ink": {
+        "role": "neutral",
+        "displayName": "Body ink",
+        "tonalRamp": [
+          "oklch(15% 0.0165 259.4)",
+          "oklch(26% 0.0165 259.4)",
+          "oklch(37% 0.0165 259.4)",
+          "oklch(49% 0.0165 259.4)",
+          "oklch(60% 0.0165 259.4)",
+          "oklch(72% 0.0165 259.4)",
+          "oklch(83% 0.0165 259.4)",
+          "oklch(95% 0.0165 259.4)"
+        ]
+      },
+      "muted": {
+        "role": "neutral",
+        "displayName": "Secondary text",
+        "tonalRamp": [
+          "oklch(15% 0.0324 255.6)",
+          "oklch(26% 0.0324 255.6)",
+          "oklch(37% 0.0324 255.6)",
+          "oklch(49% 0.0324 255.6)",
+          "oklch(60% 0.0324 255.6)",
+          "oklch(72% 0.0324 255.6)",
+          "oklch(83% 0.0324 255.6)",
+          "oklch(95% 0.0324 255.6)"
+        ]
+      },
+      "divider": {
+        "role": "neutral",
+        "displayName": "Divider",
+        "tonalRamp": [
+          "oklch(15% 0.0505 254.1)",
+          "oklch(26% 0.0505 254.1)",
+          "oklch(37% 0.0505 254.1)",
+          "oklch(49% 0.0505 254.1)",
+          "oklch(60% 0.0505 254.1)",
+          "oklch(72% 0.0505 254.1)",
+          "oklch(83% 0.0505 254.1)",
+          "oklch(95% 0.0505 254.1)"
+        ]
+      },
+      "masthead": {
+        "role": "neutral",
+        "displayName": "Masthead surface",
+        "tonalRamp": [
+          "oklch(15% 0.0314 256.9)",
+          "oklch(26% 0.0314 256.9)",
+          "oklch(37% 0.0314 256.9)",
+          "oklch(49% 0.0314 256.9)",
+          "oklch(60% 0.0314 256.9)",
+          "oklch(72% 0.0314 256.9)",
+          "oklch(83% 0.0314 256.9)",
+          "oklch(95% 0.0314 256.9)"
+        ]
+      },
+      "warning-surface": {
+        "role": "secondary",
+        "displayName": "Warning surface",
+        "tonalRamp": [
+          "oklch(15% 0.0460 71.9)",
+          "oklch(26% 0.0460 71.9)",
+          "oklch(37% 0.0460 71.9)",
+          "oklch(49% 0.0460 71.9)",
+          "oklch(60% 0.0460 71.9)",
+          "oklch(72% 0.0460 71.9)",
+          "oklch(83% 0.0460 71.9)",
+          "oklch(95% 0.0460 71.9)"
+        ]
+      },
+      "warning-ink": {
+        "role": "secondary",
+        "displayName": "Warning text",
+        "tonalRamp": [
+          "oklch(15% 0.0886 85.9)",
+          "oklch(26% 0.0886 85.9)",
+          "oklch(37% 0.0886 85.9)",
+          "oklch(49% 0.0886 85.9)",
+          "oklch(60% 0.0886 85.9)",
+          "oklch(72% 0.0886 85.9)",
+          "oklch(83% 0.0886 85.9)",
+          "oklch(95% 0.0886 85.9)"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "panel-heading": {
+        "displayName": "Panel heading",
+        "purpose": "Labels a board section."
+      },
+      "report": {
+        "displayName": "Session report",
+        "purpose": "Carries current work and supporting reservation details."
+      },
+      "timestamp": {
+        "displayName": "Timestamp",
+        "purpose": "Aligns times in message lists and timeline."
+      }
+    },
+    "shadows": [],
+    "breakpoints": [
+      {
+        "name": "masthead-wrap-max",
+        "value": "67rem"
+      },
+      {
+        "name": "mobile-max",
+        "value": "44rem"
+      },
+      {
+        "name": "compact-heading-max",
+        "value": "25rem"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Message all",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Broadcast to all sessions from the Sessions header. The icon has an accessible name and a tooltip.",
+      "html": "<button class=\"ds-primary\" aria-label=\"Message all sessions\" title=\"Message all sessions\"><svg viewBox=\"0 0 24 24\" width=\"17\" height=\"17\" aria-hidden=\"true\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.65\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M5 6h16v13H5z M5 7l8 6 8-6 M2 8v9\"/></svg></button>",
+      "css": ".ds-primary { display: inline-grid; place-items: center; width: 2.15rem; height: 2.15rem; padding: 0; border: 1px solid #8bd5ec; border-radius: 7.8px; background: #8bd5ec; color: #132839; }"
+    },
+    {
+      "name": "Resource wait",
+      "kind": "badge",
+      "refersTo": "status-warning",
+      "description": "Marks a session with a queued reservation.",
+      "html": "<span class=\"ds-warning\">Resource wait</span>",
+      "css": ".ds-warning { border-radius: 3px; background: #4a371f; color: #ffe1a0; padding: .075rem .38rem; font: 690 .76rem/1.5 Inter, sans-serif; }"
+    }
+  ],
+  "narrative": {
+    "overview": "A compact, live operations board in the Observatory palette. Each area fills its own tab, with keyboard navigation on desktop and a native selector on small screens."
+  }
+}

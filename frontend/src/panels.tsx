@@ -37,7 +37,7 @@ function SessionRow({session, name, reservations, conversation, compose, inspect
   compose: (id: string) => void; inspect: (session: Session) => void; run: Run; busy: boolean; states: string[];
 }) {
   const resume = ['paused', 'draining'].includes(session.state);
-  const canInspect = conversation && session.external_id && ['claude', 'codex'].includes(session.provider ?? '');
+  const canInspect = conversation && session.external_id && ['claude', 'codex', 'gaia'].includes(session.provider ?? '');
   const recoveryLabel = session.kind === 'job' ? 'Rerun command' : 'Resume conversation';
   const canRecover = conversation && session.recovery_reason === null && !session.successor;
   function recover() {
@@ -46,8 +46,8 @@ function SessionRow({session, name, reservations, conversation, compose, inspect
   }
   return <article className="session-row" id={session.id}>
     <div className="session-name">
-      <h3>{session.name}</h3>
-      <p title={session.id}>{[session.provider || session.kind, session.parent && `under ${name(session.parent)}`, session.pid && `PID ${session.pid}`].filter(Boolean).join(' · ')}</p>
+      <h3>{session.title || session.name}</h3>
+      <p title={session.id}>{[session.title && session.name, session.provider || session.kind, session.terminal_mode, session.parent && `under ${name(session.parent)}`, session.pid && `PID ${session.pid}`].filter(Boolean).join(' · ')}</p>
     </div>
     <div className="session-state">
       {states.map(state => <span key={state} className={`status status-${state}`}>{stateLabel(state)}</span>)}
@@ -68,18 +68,24 @@ function SessionRow({session, name, reservations, conversation, compose, inspect
           ? ` / ${number(session.context_usage.window_tokens)} tokens (${number(100 * session.context_usage.input_tokens / session.context_usage.window_tokens)}%)`
           : ' tokens'}</p>}
       {session.state === 'stale' && session.stale_reason && <p>{session.stale_reason}</p>}
+      {session.attention?.map(note => <p className="attention-note" key={note.key}>
+        {note.kind === 'permission' ? 'Permission prompt' : 'Input request'} waiting in its terminal since {clock(note.since)}
+        {note.detail && <> · <code>{note.detail}</code></>}
+      </p>)}
       {reservations.map(reservation => <p className="reservation-note" key={reservation.id}>
         {describe(reservation)} · {reservation.state === 'requested' ? reservation.reason : reservation.state}
         {reservation.eta ? ` · until ~${clock(reservation.eta)}` : ''}
         {reservation.stale_at && !session.pid ? ` · stale at ${clock(reservation.stale_at)}` : ''}
       </p>)}
     </div>
-    {(canInspect || canRecover || !terminal(session) || session.retry_at) && <div className="session-actions" role="group" aria-label={`Actions for ${session.name}`}>
+    {(canInspect || canRecover || conversation && session.terminal_action || !terminal(session) || session.retry_at) && <div className="session-actions" role="group" aria-label={`Actions for ${session.name}`}>
+      {conversation && session.terminal_action && <button disabled={busy} onClick={() => run('open_terminal',
+        {session: session.id, command: session.terminal_action}, session.id)}>{session.terminal_action === 'resume-terminal' ? 'Resume in terminal' : 'Attach terminal'}</button>}
       {canRecover && <button disabled={busy} onClick={recover}>{recoveryLabel}</button>}
       {conversation && session.retry_at && <button disabled={busy} onClick={() => run('cancel_retry', {session: session.id}, session.id)}>Cancel retry</button>}
-      {canInspect && <ActionIcon icon="conversation" label="View conversation" onClick={() => inspect(session)}/>}
+      {canInspect && <ActionIcon icon="conversation" label={terminal(session) ? 'View conversation' : 'Conversation and messages'} onClick={() => inspect(session)}/>}
       {!terminal(session) && <>
-        <ActionIcon icon="message" label="Send message" onClick={() => compose(session.id)}/>
+        {!canInspect && <ActionIcon icon="message" label="Send message" onClick={() => compose(session.id)}/>}
         {session.kind !== 'hold' && <>
           <ActionIcon icon={resume ? 'resume' : 'pause'} label={resume ? 'Resume' : 'Request pause'} disabled={busy}
             onClick={() => run('control', {session: session.id, action: resume ? 'resume' : 'pause', reason: 'Requested from message board'}, session.id)}/>
@@ -97,7 +103,7 @@ export function Sessions({state, grouping, onGroupingChange, approvals, composeA
   state: BoardState; grouping: Grouping; onGroupingChange: (group: Grouping) => void; approvals: Approval[]; composeAll: () => void; name: Name; reservations: Reservation[];
   compose: (id: string) => void; inspect: (session: Session) => void; run: Run; pending: ReadonlySet<string>;
 }) {
-  const [filter, setFilter] = useState('all');
+  const [filter, setFilter] = useState('active');
   const [query, setQuery] = useState('');
   const all = Object.values(state.sessions).reverse();
   const bySession = new Map<string, Reservation[]>();
@@ -117,7 +123,7 @@ export function Sessions({state, grouping, onGroupingChange, approvals, composeA
   const stateBySession = new Map(all.map(session => {
     const states: string[] = [];
     if (resourceWaits.has(session.id) || session.state === 'waiting') states.push('waiting');
-    if (approvalWaits.has(session.id)) states.push('approval');
+    if (approvalWaits.has(session.id) || session.attention?.length) states.push('approval');
     if (!states.length || !['running', 'waiting'].includes(session.state)) states.push(session.state);
     return [session.id, states];
   }));
@@ -125,8 +131,8 @@ export function Sessions({state, grouping, onGroupingChange, approvals, composeA
   const stateOrder = [...new Set([...Object.keys(stateLabels), ...all.map(session => session.state), filter])]
     .filter(id => id !== 'all' && id !== 'active');
   const filters = [
-    {id: 'all', label: 'All', always: true, matches: () => true},
     {id: 'active', label: 'Active', always: true, matches: (session: Session) => !terminal(session)},
+    {id: 'all', label: 'All', always: true, matches: () => true},
     ...stateOrder.map(id => ({
       id,
       label: stateLabel(id),
@@ -152,8 +158,9 @@ export function Sessions({state, grouping, onGroupingChange, approvals, composeA
   ) : grouping === 'roster' ? [
     grouped('Claude', session => session.provider === 'claude' && session.kind !== 'job'),
     grouped('Codex', session => session.provider === 'codex' && session.kind !== 'job'),
+    grouped('GAIA', session => session.provider === 'gaia' && session.kind !== 'job'),
     grouped('Jobs', session => session.kind === 'job'),
-    grouped('Other sessions', session => session.kind !== 'job' && !['claude', 'codex'].includes(session.provider ?? '')),
+    grouped('Other sessions', session => session.kind !== 'job' && !['claude', 'codex', 'gaia'].includes(session.provider ?? '')),
   ] : [{title: '', sessions: visible}];
   const shownGroups = groups.filter(group => group.sessions.length);
 
@@ -268,6 +275,7 @@ export function Reservations({reservations, name, run, pending}: {
 const approvalTitles: Record<string, string> = {
   'item/commandExecution/requestApproval': 'Command approval',
   'item/fileChange/requestApproval': 'File change approval',
+  'gaia/needs_confirmation': 'Tool approval',
   'claude/can_use_tool': 'Tool approval',
   'mcpServer/elicitation/request': 'Input needed',
 };
@@ -283,6 +291,7 @@ export function Approvals({entries, name, run, pending}: {entries: Approval[]; n
       const answer = (response: object) => run('approval_answer', {session: approval.session, approval: approval.id, response}, approval.id);
       return <article className="approval" key={approval.id}>
         <h3>{approvalTitles[approval.method] ?? 'Input needed'}</h3><p className="muted">{name(approval.session)}</p>
+        {approval.method === 'gaia/needs_confirmation' && typeof params.summary === 'string' && <p>{params.summary}</p>}
         {(params.reason || params.message) && <p>{params.reason || params.message}</p>}
         {typeof command === 'string' && command && <pre><code>{command}</code></pre>}
         {params.cwd && <p className="muted">Working directory · {params.cwd}</p>}

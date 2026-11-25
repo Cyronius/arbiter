@@ -77,6 +77,15 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(requests[0][0],'approval-1')
         c.answer('approval-1',{'decision':'decline'})
         self.assertEqual(c.t.sent[-1],{'id':'approval-1','result':{'decision':'decline'}})
+    def test_withdrawn_provider_requests_are_reported(self):
+        c=self.codex()
+        c.handle({'method':'serverRequest/resolved','params':{'threadId':'thread_1','requestId':'approval-1'}},lambda _:None,lambda *_:None)
+        self.assertEqual(c.withdrawn,['approval-1'])
+        with patch('arbiter.adapters.Transport',FakeTransport):
+            cl=Claude(self.args,self.env,Path('/project/bin/arbiter'))
+        cl.config_path.unlink(missing_ok=True)
+        cl.handle({'type':'control_cancel_request','request_id':'req-7'},lambda _:None,lambda *_:None)
+        self.assertEqual(cl.withdrawn,['req-7'])
     def test_codex_resume_preserves_thread_identity(self):
         self.args.resume='existing-thread'
         c=Codex(self.args,self.env,Path('/project/bin/arbiter'))

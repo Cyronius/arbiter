@@ -30,7 +30,9 @@ def parser():
     s = sub.add_parser("serve", help="Run the localhost daemon")
     s.add_argument("--port", type=int, default=7483)
     s.add_argument("--tray", action="store_true", help="Show a notification-area icon (Windows)")
-    s.add_argument("--unix-socket", help="Serve HTTP over a Unix socket (Linux CLI/MCP only)")
+    s.add_argument("--allow-host", action="append", default=[], metavar="NAME",
+                   help="Also accept this Host name (e.g. a Tailscale name reached through `tailscale serve --tcp`); repeatable")
+    s.add_argument("--unix-socket", help="Serve local HTTP over a Unix socket instead of TCP (Linux CLI/MCP only)")
     s.add_argument("--cpu", type=float, help="Concurrent CPU scheduling budget (default: 80%% of logical CPUs)")
     s.add_argument("--memory-mb", type=int, help="Job memory budget in MiB (default: 70%% of RAM)")
     s.add_argument("--headroom-mb", type=int, default=512, help="Keep this much measured free memory (default: 512 MiB)")
@@ -65,6 +67,9 @@ def parser():
                              help="Rerun a recorded command or resume a managed conversation")
     recover.add_argument("session", help="Predecessor attempt ID")
     recover.add_argument("--confirm-unknown", action="store_true", help="Replay after inspecting possible side effects")
+    for command, help_text in (("attach-terminal", "Interact with a live managed agent"),
+                               ("resume-terminal", "Open a saved conversation in the provider terminal UI")):
+        sub.add_parser(command, help=help_text).add_argument("session")
     cancel = sub.add_parser("cancel-retry", help="Cancel an automatic retry during backoff")
     cancel.add_argument("session")
 
@@ -164,8 +169,8 @@ def parser():
     hk.add_argument("provider", choices=["claude", "codex"])
     mcp = sub.add_parser("mcp", help="Expose Arbiter tools over MCP stdio")
     mcp.add_argument("--name", default="external-session")
-    agent = sub.add_parser("agent", help="Launch a managed Codex or Claude session")
-    agent.add_argument("provider", choices=["codex", "claude"])
+    agent = sub.add_parser("agent", help="Launch a managed Codex, Claude or GAIA session")
+    agent.add_argument("provider", choices=["codex", "claude", "gaia"])
     agent.add_argument("prompt")
     agent.add_argument("--name")
     agent.add_argument("--cwd", default=os.getcwd())
@@ -242,6 +247,9 @@ def dispatch(args, command_argv):
     if command == "demo":
         return workers.demo(args.delay)
     client = Client()
+    if command in {"attach-terminal", "resume-terminal"}:
+        from .terminal import run
+        return run(client, command, args.session)
     if command == "open":
         import webbrowser
         link = client.board_link()

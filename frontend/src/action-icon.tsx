@@ -6,11 +6,15 @@ const paths = {
   broadcast: 'M5 6h16v13H5z M5 7l8 6 8-6 M2 8v9',
   send: 'M3 10l18-7-7 18-3-8z M11 13l10-10',
   close: 'M6 6l12 12 M18 6L6 18',
+  previous: 'M14 5l-7 7 7 7',
+  next: 'M10 5l7 7-7 7',
   older: 'M12 19V5 M6 11l6-6 6 6',
   pause: 'M8 5v14 M16 5v14',
   resume: 'M8 5l11 7-11 7z',
   update: 'M19 11a7 7 0 1 0-2 5 M19 5v6h-6',
   release: 'M6 6h12v12H6z',
+  copy: 'M9 9h11v11H9z M5 15H4V4h11v1',
+  check: 'M5 12.5l4.5 4.5L19 7.5',
 } as const;
 
 export function ActionIcon({icon, label, className, type = 'button', ...button}: ButtonHTMLAttributes<HTMLButtonElement> & {

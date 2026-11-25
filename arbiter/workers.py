@@ -527,10 +527,19 @@ def status_text(state: dict) -> str:
     live = [s for s in sessions.values() if s["state"] not in TERMINAL and s["kind"] not in {"hold"}]
     if live:
         lines.append("")
+        width_label = 56 if any(s.get("title") for s in live) else 28
         for s in sorted(live, key=lambda s: s["created"]):
-            lines.append(f"  {s['name']:<28} {s['kind']:<8} {s['state']:<9} {s['id']}  {s['status'][:70]}")
+            label = s["name"]
+            if s.get("title"):
+                room = max(12, width_label - len(label) - 3)
+                title = s["title"] if len(s["title"]) <= room else s["title"][:room - 1] + "…"
+                label = f"{title} ({label})"
+            lines.append(f"  {label:<{width_label}} {s['kind']:<8} {s['state']:<9} {s['id']}  {s['status'][:70]}")
             if s.get("stale_reason"):
                 lines.append(f"    {s['stale_reason']}")
+            for note in s.get("attention", []):
+                what = "permission prompt" if note["kind"] == "permission" else "input request"
+                lines.append(f"    Needs you in its terminal since {clock(note['since'])}: {what}" + (f" ({note['detail'][:70]})" if note["detail"] else ""))
             if s.get("predecessor"):
                 lines.append(f"    Recovery of {s['predecessor']} (original {s['original']})")
             usage = s.get("context_usage")
