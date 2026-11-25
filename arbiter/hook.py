@@ -141,7 +141,7 @@ class Hook:
 
 def main(provider: str) -> int:
     try:
-        data = json.load(sys.stdin)
+        data = json.load(sys.stdin.buffer if hasattr(sys.stdin, "buffer") else sys.stdin)
         if not isinstance(data, dict) or not data.get("session_id"):
             return 0
         client = Client(patient=0, timeout=15)

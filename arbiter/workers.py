@@ -11,8 +11,7 @@ import time
 from . import config as configuration
 from . import identity, system
 from .client import Client, state_dir
-from .system import group_alive
-from .launch import tracked_popen
+from .launch import STOP_SIGNALS, exit_code, signal_group, tracked_popen, work_alive
 from .recovery import OPTIONS
 
 TERMINAL = {"finished", "failed"}
@@ -30,13 +29,13 @@ class Stopped(BaseException):
 def catch_signals():
     def handler(signum, frame):
         raise Stopped(signum)
-    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+    for sig in STOP_SIGNALS:
         signal.signal(sig, handler)
 
 
 def ignore_signals():
     """While cleaning up, a second signal must not abandon the cleanup halfway."""
-    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+    for sig in STOP_SIGNALS:
         signal.signal(sig, signal.SIG_IGN)
 
 
@@ -119,32 +118,23 @@ def acquire(client: Client, sid: str, rid: str) -> dict:
 class NoiseMeter:
     """CPU use of processes outside a measured run, sampled once a second."""
 
-    def __init__(self, own_session: int, limit_pct: float):
-        self.own, self.limit = own_session, limit_pct
-        self.tick = os.sysconf("SC_CLK_TCK")
-        self.me = os.getpid()
+    def __init__(self, proc, limit_pct: float):
+        self.proc, self.limit = proc, limit_pct
         self.last, self.at = self.read(), time.monotonic()
         self.over: dict[int, list] = {}
 
-    def read(self) -> dict[int, tuple[int, str]]:
-        out = {}
-        for pid, f in system.processes():
-            try:
-                if pid == self.me or int(f[3]) == self.own:
-                    continue
-                out[pid] = (int(f[11]) + int(f[12]), "")
-            except (IndexError, ValueError):
-                pass
-        return out
+    def read(self) -> dict[tuple[int, int], float]:
+        return {(pid, started): seconds for pid, started, seconds in
+                system.process_cpu(self.proc.pid, getattr(self.proc, "arbiter_started", None))}
 
     def sample(self):
         now, at = self.read(), time.monotonic()
         dt = max(at - self.at, 1e-3)
-        for pid, (ticks, _) in now.items():
-            before = self.last.get(pid)
+        for (pid, started), seconds in now.items():
+            before = self.last.get((pid, started))
             if before is None:
                 continue
-            pct = 100 * (ticks - before[0]) / self.tick / dt
+            pct = 100 * (seconds - before) / dt
             if pct > self.limit:
                 entry = self.over.setdefault(pid, [system.comm(pid), 0, 0.0])
                 entry[1] += 1
@@ -239,23 +229,23 @@ def execute_job(args, argv, sid, client, data, rid=None):
         except (RuntimeError, OSError):
             pass
         code = 128 + e.signum
-        if proc and proc.poll() is None:
+        if proc and work_alive(proc):
             # Pass the same signal to the whole command so it can clean up.
             try:
-                os.killpg(proc.pid, signal.SIGINT if e.signum == signal.SIGINT else signal.SIGTERM)
+                signal_group(proc, signal.SIGINT if e.signum == signal.SIGINT else signal.SIGTERM)
                 proc.wait(timeout=10)
             except (ProcessLookupError, subprocess.TimeoutExpired):
                 pass
-        stopped = not proc or (proc.poll() is not None and not group_alive(proc.pid))
+        stopped = not proc or not work_alive(proc)
     except BaseException:
         ignore_signals()
-        if proc and proc.poll() is None:
+        if proc and work_alive(proc):
             try:
-                os.killpg(proc.pid, signal.SIGTERM)
+                signal_group(proc, signal.SIGTERM)
                 proc.wait(timeout=10)
             except (ProcessLookupError, subprocess.TimeoutExpired):
                 pass
-        stopped = not proc or (proc.poll() is not None and not group_alive(proc.pid))
+        stopped = not proc or not work_alive(proc)
         raise
     finally:
         ignore_signals()
@@ -263,7 +253,7 @@ def execute_job(args, argv, sid, client, data, rid=None):
         try:
             if stopped:
                 result = proc.returncode if proc else None
-                oom = observed and result == -signal.SIGKILL and system.oom_killed(proc.pid, started_at)
+                oom = observed and result == -getattr(signal, "SIGKILL", 9) and system.oom_killed(proc.pid, started_at)
                 if cancelled:
                     status = "Command cancelled"
                 elif oom:
@@ -283,15 +273,14 @@ def execute_job(args, argv, sid, client, data, rid=None):
         except (RuntimeError, OSError) as e:
             say(f"could not record the finish ({e}); Arbiter will release it when this process is gone")
     if code:
-        # A negative code means the command died from a signal; report the shell convention 128+N.
-        sys.exit(code if code > 0 else 128 - code)
+        sys.exit(exit_code(code))
 
 
 def supervise(client, sid, proc, args, yield_file) -> bool:
     """Heartbeat, answer requests and (for --measure) sample noise until the command's group exits."""
-    meter = NoiseMeter(proc.pid, configuration.load()["measure"]["noise_core_pct"]) if args.measure else None
+    meter = NoiseMeter(proc, configuration.load()["measure"]["noise_core_pct"]) if args.measure else None
     began, last, yielded = time.monotonic(), 0.0, False
-    while proc.poll() is None or group_alive(proc.pid):
+    while work_alive(proc):
         time.sleep(1 if meter else .5)
         if meter:
             meter.sample()
@@ -308,10 +297,10 @@ def supervise(client, sid, proc, args, yield_file) -> bool:
                 if args.preemptible:
                     yielded = True
                     yield_file.parent.mkdir(parents=True, exist_ok=True)
-                    yield_file.write_text(c["reason"] + "\n")
+                    yield_file.write_text(c["reason"] + "\n", encoding="utf-8")
                     if args.yield_signal:
                         try:
-                            os.killpg(proc.pid, signal.SIGTERM)
+                            signal_group(proc, signal.SIGTERM)
                         except ProcessLookupError:
                             pass
                     client.action("report", session=sid, status=f"Yielding: {c['reason']}",

@@ -48,8 +48,14 @@ noise_core_pct = 50
 def path() -> Path:
     if os.environ.get("ARBITER_CONFIG"):
         return Path(os.environ["ARBITER_CONFIG"])
+    if os.name == "nt":
+        return app_directory() / "config.toml"
     base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
     return Path(base) / "arbiter" / "config.toml"
+
+
+def app_directory() -> Path:
+    return Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData/Local") / "Arbiter"
 
 
 def merge(base: dict, extra: dict) -> dict:
@@ -109,7 +115,7 @@ def phase_guidance(minutes: int) -> str:
 def load(file: Path | None = None) -> dict:
     file = file or path()
     try:
-        data = tomllib.loads(file.read_text())
+        data = tomllib.loads(file.read_text(encoding="utf-8-sig"))
     except FileNotFoundError:
         data = {}
     return validate(merge(DEFAULTS, data))

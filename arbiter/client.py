@@ -4,12 +4,27 @@ import os
 import time
 import socket
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 
 def state_dir():
-    return Path(os.environ.get("ARBITER_STATE_DIR", str(Path.home() / ".local/state/arbiter")))
+    if override := os.environ.get("ARBITER_STATE_DIR"):
+        return Path(override)
+    if os.name == "nt":
+        from .config import app_directory
+        return app_directory() / "state"
+    return Path.home() / ".local/state/arbiter"
+
+
+def read_connection(directory):
+    path = directory / "connection.json"
+    if os.name == "nt":
+        from .win32 import open_shared_file
+        with open_shared_file(path) as file:
+            return json.load(file)
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def board_location(url):
@@ -39,7 +54,7 @@ class Client:
             deadline = time.monotonic() + patient
             while True:
                 try:
-                    connection = json.loads((state_dir() / "connection.json").read_text())
+                    connection = read_connection(state_dir())
                     break
                 except (FileNotFoundError, ValueError):
                     if time.monotonic() + 1 > deadline:
@@ -54,6 +69,12 @@ class Client:
     def scoped(self, token):
         """A client acting with a session-scoped token against the same daemon."""
         return Client(url=self.url, token=token, patient=self.patient, timeout=self.timeout)
+
+    def board_link(self, *, tab=None):
+        link = self.request("/api/launch", {})["url"]
+        if tab:
+            link += "&" + urllib.parse.urlencode({"tab": tab})
+        return link
 
     def request(self, path, body=None, timeout=None):
         timeout = timeout or self.timeout
@@ -73,6 +94,8 @@ class Client:
     def request_once(self, path, body, timeout):
         raw = json.dumps(body).encode() if body is not None else None
         if self.url.startswith("unix://"):
+            if os.name == "nt":
+                raise RuntimeError("Unix socket connections are available on Linux. Use localhost TCP on Windows.")
             conn = UnixConnection(self.url.removeprefix("unix://"), timeout)
             try:
                 conn.request("POST" if raw is not None else "GET", path, body=raw,

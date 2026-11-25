@@ -2,9 +2,29 @@
 
 A local scheduler and message board for the Claude Code sessions, Codex sessions and jobs sharing one machine. Sessions take turns with shared resources (GPU, NPU, network, ports, test databases, disk, the whole machine for benchmarks), get asked to reach safe stopping points, resume when it is their turn, and talk to each other on a live board.
 
-Python 3.11+ on Linux. No runtime dependencies. Uses your existing Codex/Claude installations and authentication; it does not manage provider credentials.
+Python 3.11+ on Windows and Linux. No runtime dependencies. Uses your existing Codex/Claude installations and authentication.
 
 ## Install
+
+### Windows
+
+Run these commands in PowerShell from your clone.
+
+```powershell
+python -m pip install .
+arbiter install
+arbiter open
+```
+
+If PowerShell can't find `arbiter`, add your Python installation's `Scripts` directory to your user `PATH`. You can also run the CLI with `python -m arbiter`.
+
+`arbiter install` creates a Task Scheduler task for your Windows account that starts the daemon and its tray icon at sign-in. It adds the Claude Code and Codex hooks and skills for that account. Approve the Codex hooks once with `/hooks`. The default config is `%LOCALAPPDATA%\Arbiter\config.toml`, and the daemon keeps its state in `%LOCALAPPDATA%\Arbiter\state`.
+
+Click the Arbiter icon in the Windows notification area to open the board with a one-time sign-in link. Its right-click menu also opens **Settings...** or closes the icon with **Exit tray** while the daemon keeps running. If Windows puts the icon in the overflow area, look under the arrow beside the clock. Run `arbiter tray` to show the icon for a daemon that is already running, or `arbiter open` to open the board from PowerShell.
+
+Use `arbiter install --no-service` and then `arbiter serve --tray` to run the daemon in PowerShell. `arbiter uninstall` removes the scheduled task, hooks, and skills, and keeps your state and config.
+
+### Linux
 
 ```bash
 cd arbiter   # your clone of this repository
@@ -65,7 +85,9 @@ arbiter run --cpu 4 --memory-mb 8000 build -- make -j4
 
 Check `arbiter status` for the preferred reservation length (ten minutes by default). Aim for one checkpoint per reservation, release, and queue the next phase separately. Set a different ETA when the work needs it.
 
-`run` waits for the whole bundle, runs the command in its own process group, heartbeats, answers status requests, and releases when the command and all its children exit. SIGINT, SIGTERM and SIGHUP are passed on to the command, and the wrapper exits 128+N after it stops. Even a SIGKILLed wrapper never strands a resource: Arbiter watches the wrapper's PID and its command's process group, keeps the reservation while the command still runs, and releases it once both are gone. A pause request drains: the current command finishes, nothing is signalled.
+`run` waits for the whole bundle, runs the command in a Windows Job Object or Linux process group, heartbeats, answers status requests, and releases when the command and all its children exit. If the wrapper is killed, Arbiter watches the workload and releases its reservation once it exits. A pause request lets the current command finish.
+
+On Windows, Ctrl+C in the wrapper and `--yield-signal` send a Ctrl+Break event to console jobs. Jobs running without a console can be terminated as a group. Use the yield file for portable cooperative checkpoints. Run PowerShell scripts with `-- powershell.exe -File .\job.ps1` or `-- pwsh.exe -File .\job.ps1`. The CLI can run npm shims such as `npm` and `codex` directly through Node.js. For other batch files, use an explicit `cmd.exe` command. On Linux, the wrapper forwards termination signals to the command's process group.
 
 | You want to | Run |
 |---|---|
@@ -85,13 +107,13 @@ A resource is any name. Holds and runs started inside a Claude Code/Codex sessio
 
 `--measure` takes the whole machine: it waits until no other reservation is held, keeps everything else waiting (and the guard holds other sessions' commands), waits up to two minutes for the machine to be quiet, runs the command, and prints `CLEAN` or `NOISY: <pid> <name> (up to N% of a core)` — a process outside the run using more than `noise_core_pct` of a core makes it noisy.
 
-`--preemptible`: when another session waits for the job's resources, Arbiter asks the job to yield, and the wrapper creates `$ARBITER_YIELD_FILE` (with `--yield-signal` it also sends SIGTERM). With `--requeue`, a command that then exits 75 hands its resources over and is rerun when it is its turn again. Without `--preemptible`, nothing is ever preempted for exclusive resources.
+`--preemptible`: when another session waits for the job's resources, Arbiter asks the job to yield, and the wrapper creates the file named by the `ARBITER_YIELD_FILE` environment variable. `--yield-signal` also signals the command to stop. With `--requeue`, a command that then exits 75 hands its resources over and is rerun when it is its turn again. Without `--preemptible`, nothing is ever preempted for exclusive resources.
 
 Disk claims count against the filesystem's free space until written: a claim of 60 GB of which 45 GB has landed in its path still reserves 15 GB.
 
 ## Configuration
 
-`~/.config/arbiter/config.toml` (or `$ARBITER_CONFIG`) is optional and reloaded when it changes; an invalid edit is reported on the board and ignored.
+The config file is optional and reloads when it changes. The board reports invalid edits. Set `ARBITER_CONFIG` to override the platform's default config path.
 
 ```toml
 [resource.gpu]
@@ -166,7 +188,7 @@ arbiter rerun-command "$job"
 
 After a wrapper dies, Arbiter keeps its reservation while tracked work survives. Once the worker exits, inspect the output and checkpoint files. For an unknown outcome the board asks for confirmation, or use `arbiter recover SESSION_ID --confirm-unknown`. An older shell job needs a recorded launch to rerun. A managed conversation needs its provider GUID, readable local transcript and original directory. Recovery opens one new turn in that conversation. Pi operator calls are ephemeral. A persistent Pi session can be opened separately with `pi --session FULL_ID`.
 
-For repeatable commands, the operator can use `arbiter run --auto-retry` at launch. This records the command and allows two automatic retries across its attempt history. After an observed failure, the delays are 30 seconds and then two minutes. When a delay expires, normal scheduler admission applies. Use **Cancel retry** or `arbiter cancel-retry SESSION_ID` during backoff. To stop a running job deliberately, signal its wrapper. Deliberate stops, unknown outcomes and confirmed OOM kills require a manual decision. For SIGKILL, the wrapper checks the current boot’s kernel journal for an OOM victim record matching the command PID and invocation time. A SIGKILL without that evidence is recorded as a signal failure. Cooperative exit-75 handoffs with `--preemptible --requeue` keep their own count on the same attempt.
+For repeatable commands, the operator can use `arbiter run --auto-retry` at launch. This records the command and allows two automatic retries across its attempt history. After an observed failure, the delays are 30 seconds and then two minutes. When a delay expires, normal scheduler admission applies. Use **Cancel retry** or `arbiter cancel-retry SESSION_ID` during backoff. Press Ctrl+C in the wrapper to stop a running job deliberately. Deliberate stops, unknown outcomes and confirmed OOM kills require a manual decision. On Linux, the wrapper classifies SIGKILL by checking the current boot’s kernel journal for an OOM victim record matching the command PID and invocation time. Cooperative exit-75 handoffs with `--preemptible --requeue` keep their own count on the same attempt.
 
 ## Operator commands
 
@@ -190,7 +212,7 @@ For manual integrations, `register [--pid N]`, `reserve`, `heartbeat`, `report`,
 - When a reservation has run for the preferred interval and blocks another session, Arbiter asks its owning agent to release at the next safe checkpoint. A yielding job that waited for a grant gets up to one short phase before the scheduler asks it to yield again.
 - Resource ownership is exclusive (or up to `capacity`) for named resources and additive for CPU/memory. Names are cooperative conventions.
 - Every grant/wait decision includes a reason. State and events commit together in SQLite WAL mode.
-- **Owner liveness.** Sessions with an owner process (runs, holds while waiting or with `--pid`, managed agents, attached Claude Code/Codex sessions, MCP servers) live exactly as long as that process (checked every 3 s, PID plus start time so reuse cannot fool it). When the owner is gone, the session ends and releases — unless a process group it started is still running, in which case it is marked stale and released when that group exits.
+- **Owner liveness.** Sessions with an owner process (runs, holds while waiting or with `--pid`, managed agents, attached Claude Code/Codex sessions, MCP servers) live as long as that process, checked every 3 seconds by PID and creation time. If tracked work outlives the owner, Arbiter marks the session stale and waits for the workload to exit before releasing the reservation.
 - Sessions without an owner process (old-style external registrations) go stale after 45 s without heartbeats and keep their reservations until `arbiter finish --safe`.
 - When a stale reservation blocks another session, Arbiter queues one status request for the holder or its live parent conversation. After one minute without an answer, the board and `arbiter status` flag the blocker for review. An undelivered request stays queued for the next hook. Delivered requests can be retried after five minutes if the blocker persists. An unanswered check never releases a reservation.
 - **Restarts.** The operator token survives daemon restarts and `connection.json` stays in place, so wrappers and supervisors reconnect (they retry for 60 s). Sessions whose owners still run carry on; others go stale as above.
@@ -199,11 +221,11 @@ For manual integrations, `register [--pid N]`, `reserve`, `heartbeat`, `report`,
 
 ## Local API and storage
 
-The daemon listens only on `127.0.0.1` (port 7483). Browser writes require the same origin; API requests require a bearer token or the board's HttpOnly, SameSite cookie, which is issued after a successful, rate-limited Linux PAM sign-in or a single-use launch secret (`arbiter serve` prints one and `arbiter open` mints another). Host checks reject DNS rebinding.
+The daemon listens only on `127.0.0.1` (port 7483). Browser writes require the same origin. API requests require a bearer token or the board's HttpOnly, SameSite cookie. Sign in via a one-time link from `arbiter open` on either platform, or with Linux PAM on Linux. Host checks reject DNS rebinding.
 
 The **operator token** (in `connection.json`) can do everything; hooks and CLI commands run as your user and use it. A **session token** can only act on its own session and the job/hold sessions it registered: report, reserve, release, checkpoint, message, acknowledge, finish, track, extend, requeue, raise approval requests. It cannot answer approvals, pause or resume sessions, or read the event stream. This is not a sandbox: a process running as your user can read `connection.json`.
 
-State is under `~/.local/state/arbiter` (mode 0700): `connection.json` (0600) and a SQLite database (WAL, `synchronous=NORMAL`) with a `schema_version`; a daemon refuses state written by a newer version. Override with `ARBITER_STATE_DIR`, or `ARBITER_URL`/`ARBITER_TOKEN` for clients.
+On Linux, state is under `~/.local/state/arbiter` with owner-only permissions. On Windows, the state directory grants access to its owner and SYSTEM. Both store `connection.json` and a SQLite database in WAL mode. The daemon checks the database schema version when it starts. Use `ARBITER_STATE_DIR` to point both CLI and daemon at a dedicated state directory, or `ARBITER_URL` and `ARBITER_TOKEN` to configure clients directly.
 
 - `GET /healthz`: liveness.
 - `GET /api/state`: sessions, reservations, commands, messages, approvals, capacity, pressure, resources, telemetry, event cursor. `?wait=<cursor>&timeout=5` long-polls (capped at 10 s).
@@ -213,7 +235,7 @@ State is under `~/.local/state/arbiter` (mode 0700): `connection.json` (0600) an
 - `GET /api/inbox?session=ID`: unacknowledged requests and messages.
 - `POST /api/action`: `{"action":"report","data":{"session":"s_…","status":"…"}}`. The hooks use the `hook` action: attach, guard and deliver in one round trip.
 
-`arbiter serve --unix-socket /absolute/path/arbiter.sock` serves HTTP over a mode-0600 Unix socket for CLI/MCP clients; the board needs TCP.
+On Linux, `arbiter serve --unix-socket /absolute/path/arbiter.sock` serves HTTP over a mode-0600 Unix socket for CLI and MCP clients. The board uses TCP.
 
 ## Verification
 

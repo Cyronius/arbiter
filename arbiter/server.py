@@ -1,4 +1,3 @@
-import fcntl
 import hmac
 import json
 import os
@@ -14,14 +13,23 @@ import traceback
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from tempfile import mkstemp
 from urllib.parse import parse_qs, urlsplit
 
-from . import operator, pam, recovery, system, transcripts
-from .client import board_location, state_dir
+from . import operator, recovery, system, transcripts
+from .client import Client, board_location, read_connection, state_dir
 from .config import Config
 from .core import PROVIDERS, TERMINAL, Store
 
 system_memory = system.memory
+if system.WINDOWS:
+    from .win32 import lock_file, protect
+else:
+    import fcntl
+    from . import pam
+
+    def lock_file(file):
+        fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 # Everything a session-scoped token may do, and only to its own session. A session token may
 # also register child job/hold sessions under itself (see `permitted`).
@@ -74,7 +82,7 @@ class Launcher:
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    allow_reuse_address = not system.WINDOWS
 
     def __init__(self, address, store, token):
         self.store, self.token = store, token
@@ -99,6 +107,8 @@ class Server(ThreadingHTTPServer):
                 os.umask(old)
             self.server_name, self.server_port = "localhost", 0
         else:
+            if system.WINDOWS:
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
             super().server_bind()
 
 
@@ -211,7 +221,7 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/api/disk":
             try:
                 path, gb = query["path"][0], float(query.get("gb", ["0"])[0])
-                if not path.startswith("/"):
+                if not Path(path).is_absolute():
                     raise ValueError("path must be absolute")
                 return self.response(200, self.server.store.disk_check(path, gb))
             except (KeyError, ValueError, OSError) as e:
@@ -317,10 +327,13 @@ class Handler(BaseHTTPRequestHandler):
             return self.response(400, {"error": str(e)})
 
     def login_page(self, status, message=""):
-        page = (Path(__file__).parent / "static" / "login.html").read_bytes()
+        filename = "login-windows.html" if system.WINDOWS else "login.html"
+        page = (Path(__file__).parent / "static" / filename).read_bytes()
         return self.response(status, page.replace(b"<!-- feedback -->", message.encode()), "text/html; charset=utf-8")
 
     def login(self):
+        if system.WINDOWS:
+            return self.login_page(405)
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if self.headers.get_content_type() != "application/x-www-form-urlencoded" or not 0 < length <= 8192:
@@ -378,31 +391,53 @@ def monitor_context(server):
 
 
 def write_private(path, content):
-    """Create a file readable only by the owner from the first byte (no chmod-after-write window)."""
-    tmp = path.with_name(path.name + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(content)
-    tmp.replace(path)
+    """Publish the connection file atomically inside the private state directory."""
+    fd, name = mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def serve(args):
     if args.headroom_mb < 0:
         raise ValueError("memory headroom must be nonnegative")
+    if system.WINDOWS and args.unix_socket:
+        raise ValueError("--unix-socket is available on Linux. Use localhost TCP on Windows.")
+    if args.tray and not system.WINDOWS:
+        raise ValueError("--tray is available on Windows")
     directory = state_dir()
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(directory, 0o700)
-    lock = (directory / "daemon.lock").open("w")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        lock.close()
+    if system.WINDOWS:
+        protect(directory, directory=True)
+    else:
+        os.chmod(directory, 0o700)
+    with (directory / "daemon.lock").open("a+b") as lock:
         try:
-            url = json.loads((directory / "connection.json").read_text())["url"]
-        except (OSError, KeyError, ValueError):
-            raise RuntimeError("Arbiter has the daemon lock but its address is not available yet") from None
-        print(f"Arbiter is already running.\n{board_location(url)}")
-        return
+            lock_file(lock)
+        except BlockingIOError:
+            return already_running(directory)
+        serve_locked(args, directory)
+
+
+def already_running(directory):
+    try:
+        url = read_connection(directory)["url"]
+    except (OSError, KeyError, ValueError):
+        raise RuntimeError("Arbiter has the daemon lock but its address is not available yet") from None
+    print(f"Arbiter is already running.\n{board_location(url)}")
+
+
+def serve_locked(args, directory):
+    if system.WINDOWS:
+        # A pre-existing state directory may contain files with wider permissions.
+        for name in ("arbiter.sqlite3", "arbiter.sqlite3-shm", "arbiter.sqlite3-wal", "connection.json"):
+            path = directory / name
+            if path.exists():
+                protect(path)
     meter = system.CpuMeter()
     memory = system_memory()
     config = Config()
@@ -417,7 +452,7 @@ def serve(args):
     # once, can reconnect to a restarted daemon instead of failing authentication.
     previous = {}
     try:
-        previous = json.loads(connection.read_text())
+        previous = read_connection(directory)
     except (OSError, ValueError):
         pass
     token = previous.get("token")
@@ -435,7 +470,11 @@ def serve(args):
             path.unlink()
         except FileNotFoundError:
             pass
-    server = Server(address, store, token)
+    try:
+        server = Server(address, store, token)
+    except BaseException:
+        store.db.close()
+        raise
     url = "unix://" + address if args.unix_socket else f"http://127.0.0.1:{server.server_port}"
     write_private(connection, json.dumps({"url": url, "token": token}))
 
@@ -460,18 +499,27 @@ def serve(args):
     operator_thread = threading.Thread(target=operator.run, args=(store, server.stopping), daemon=True)
     operator_thread.start()
     print(f"Arbiter listening at {url}", flush=True)
-    if not args.unix_socket:
+    if system.WINDOWS:
+        print("Run `arbiter open` to sign in to the board.", flush=True)
+    elif not args.unix_socket:
         print(f"Sign in to the board at {url}/\n"
               f"One-time launch link: {url}/?k={server.launcher.mint(ttl=None)}", flush=True)
     def terminate(signum, frame):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, terminate)
+    tray = None
     try:
+        if args.tray:
+            from .tray import Tray
+            tray = Tray(Client(url=url, token=token, timeout=2))
+            tray.start()
         server.serve_forever(poll_interval=.25)
     except KeyboardInterrupt:
         pass
     finally:
         server.stopping.set()
+        if tray:
+            tray.stop()
         with store.changed:
             store.changed.notify_all()
         monitor_thread.join(timeout=5)
@@ -482,5 +530,4 @@ def serve(args):
             store.db.close()
         if args.unix_socket:
             Path(address).unlink(missing_ok=True)
-        # connection.json stays (owner-only) so clients wait for a restart rather than giving up.
-        lock.close()
+        # connection.json stays so clients wait for a restart rather than giving up.

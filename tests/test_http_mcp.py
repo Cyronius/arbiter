@@ -1,6 +1,7 @@
 """Exercise the real HTTP parser/handlers using byte streams, without opening sockets."""
 import io
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -120,13 +121,13 @@ class HTTPMCPTests(unittest.TestCase):
         self.assertEqual(reservations[urgent]["queue_position"], 2)
 
     def test_second_serve_prints_the_daemons_recorded_address(self):
-        import fcntl
         from contextlib import redirect_stdout
         from arbiter.cli import main
+        from arbiter.server import lock_file
 
         directory = Path(self.tmp.name)
         with (directory / "daemon.lock").open("w") as lock, patch("arbiter.server.state_dir", return_value=directory):
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            lock_file(lock)
             for url in ("http://127.0.0.1:8111", "unix:///tmp/test-arbiter.sock"):
                 (directory / "connection.json").write_text(json.dumps({"url": url, "token": "private-test-token"}))
                 output = io.StringIO()
@@ -159,8 +160,10 @@ class HTTPMCPTests(unittest.TestCase):
 
         # A stdio peer that can only finish after receiving the answer to its request.
         peer = """
-import json, signal, sys
-signal.alarm(8)
+import json, os, sys, threading
+watchdog = threading.Timer(8, os._exit, [124])
+watchdog.daemon = True
+watchdog.start()
 def receive():
     return json.loads(sys.stdin.readline())
 def send(message):
@@ -259,6 +262,7 @@ send({"method": "turn/completed", "params": {"turn": {"status": "completed"}}})
         self.assertEqual(self.client.inbox(bob)["messages"], [broadcast])
         reply["action"] = "operator_message"
         self.assertEqual(self.client.exchange("/api/action", reply, token=token)[0], 403)
+    @unittest.skipIf(os.name == "nt", "Linux PAM authentication")
     def test_linux_browser_sign_in(self):
         self.server.login_lock = threading.Lock()
         self.server.next_login = 0

@@ -17,7 +17,7 @@ from typing import Any
 
 from . import guard, operator, recovery, transcripts
 from .config import Config, phase_guidance, validate_operator, validate_phase_minutes
-from .system import Probe
+from .system import Probe, boot
 
 TERMINAL = {"finished", "failed"}
 SCHEMA_VERSION = 3
@@ -75,10 +75,11 @@ class Store:
         if str(path) != ":memory:":
             fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
             try:
-                os.fchmod(fd, 0o600)
+                if os.name != "nt":
+                    os.fchmod(fd, 0o600)
             finally:
                 os.close(fd)
-        self.boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        self.boot_id, self.booted_at = boot()
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.execute("PRAGMA journal_mode=WAL")
         # A workload can start immediately after a tracking acknowledgement.
@@ -136,11 +137,10 @@ class Store:
         # 1 -> 2: optional owner PIDs, parents, ETAs, measure and disk fields; all read with defaults.
         if version < 3:
             # Early managed supervisors reported the provider ID before there was a dedicated field.
-            booted = time.time() - time.clock_gettime(time.CLOCK_BOOTTIME)
             for s in state["sessions"].values():
                 if s.get("pid") and "boot_id" not in s:
                     # The old schema has only a start tick. A session created before this boot has no surviving PID.
-                    s["boot_id"] = "previous boot" if s["created"] < booted else self.boot_id
+                    s["boot_id"] = "previous boot" if s["created"] < self.booted_at else self.boot_id
                 if s["kind"] not in PROVIDERS or s.get("external_id"):
                     continue
                 for (body,) in self.db.execute("SELECT body FROM events WHERE session=? AND kind='session.status' ORDER BY id", (s["id"],)):
@@ -293,10 +293,7 @@ class Store:
             return False
         for group in s.get("groups", []):
             original = s.get("group_starts", {}).get(str(group))
-            current = self.probe.start_time(group)
-            if original is not None and current is not None and original != current:
-                continue
-            if self.probe.group_alive(group):
+            if self.probe.group_alive(group, original):
                 return True
         return False
 
@@ -758,7 +755,7 @@ class Store:
             r["measure"] = True
         if disk_gb:
             path = text(d.get("disk_path"), "disk_path", 1000)
-            if not path.startswith("/"):
+            if not Path(path).is_absolute():
                 raise ValueError("disk_path must be absolute")
             r.update(disk_gb=disk_gb, disk_path=path, disk_device=self.probe.disk(path)["device"])
         if d.get("eta") is not None:

@@ -1,5 +1,6 @@
 """Owner liveness, holds and ETAs, families, capacity, measurement, yielding, disk claims, attach and the guard."""
 import json
+import os
 import tempfile
 import threading
 import time
@@ -27,8 +28,9 @@ class FakeProbe:
     def start_time(self, pid):
         return 1 if pid in self.pids else None
 
-    def group_alive(self, pgid):
-        return pgid in self.groups
+    def group_alive(self, pgid, started=None):
+        current = self.start_time(pgid)
+        return pgid in self.groups and (started is None or current is None or started == current)
 
     def disk(self, path):
         return {"device": 1, "free_gb": self.free_gb}
@@ -116,11 +118,11 @@ class LivenessTests(Base):
 
     def test_stale_disk_claim_checks_only_when_the_claim_blocks_available_space(self):
         holder, waiter = self.register(), self.register()
-        self.apply("reserve", holder, disk_gb=70, disk_path="/models")
+        self.apply("reserve", holder, disk_gb=70, disk_path=str(self.path.parent / "models"))
         self.store.beats[holder] -= 100
         self.store.apply("tick", {})
         self.probe.free_gb = 35
-        self.apply("reserve", waiter, disk_gb=40, disk_path="/other")
+        self.apply("reserve", waiter, disk_gb=40, disk_path=str(self.path.parent / "other"))
         self.assertFalse(self.store.inbox(holder)["commands"])
         self.probe.free_gb = 100
         self.store.apply("tick", {})
@@ -288,14 +290,16 @@ class SchedulingTests(Base):
 
     def test_disk_claims_count_until_written(self):
         a, b = self.register(kind="hold"), self.register(kind="hold")
-        ra = self.apply("reserve", a, disk_gb=70, disk_path="/data/a", eta=600)
+        data = self.path.parent / "data"
+        first, second = str(data / "a"), str(data / "b")
+        ra = self.apply("reserve", a, disk_gb=70, disk_path=first, eta=600)
         self.assertEqual(ra["state"], "granted")
-        rb = self.apply("reserve", b, disk_gb=40, disk_path="/data/b", eta=600)
+        rb = self.apply("reserve", b, disk_gb=40, disk_path=second, eta=600)
         self.assertEqual(rb["state"], "requested")
         self.assertIn("Disk", rb["reason"])
-        self.assertFalse(self.store.disk_check("/data", 40)["ok"])
+        self.assertFalse(self.store.disk_check(str(data), 40)["ok"])
         # 60 GB of the claim has been written and free space fell accordingly: 10 GB still owed.
-        self.probe.sizes["/data/a"], self.probe.free_gb = 60.0, 55.0
+        self.probe.sizes[first], self.probe.free_gb = 60.0, 55.0
         self.store.last_disk = -1e9
         self.store.apply("tick", {})
         self.assertEqual(self.reservation(rb["id"])["state"], "granted")
@@ -517,7 +521,7 @@ class InstallTests(unittest.TestCase):
             self.assertEqual(data["model"], "x")
             ups = data["hooks"]["UserPromptSubmit"]
             self.assertEqual(len(ups), 2)
-            self.assertEqual(data["hooks"]["PreToolUse"][0]["matcher"], "Bash")
+            self.assertEqual(data["hooks"]["PreToolUse"][0]["matcher"], "^(Bash|PowerShell)$" if os.name == "nt" else "Bash")
             self.assertEqual(data["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"], 300)
             install.set_hooks(path, None)
             data = json.loads(path.read_text())

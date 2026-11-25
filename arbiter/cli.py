@@ -29,17 +29,19 @@ def parser():
 
     s = sub.add_parser("serve", help="Run the localhost daemon")
     s.add_argument("--port", type=int, default=7483)
-    s.add_argument("--unix-socket", help="Serve local HTTP over a Unix socket instead of TCP (CLI/MCP only)")
+    s.add_argument("--tray", action="store_true", help="Show a notification-area icon (Windows)")
+    s.add_argument("--unix-socket", help="Serve HTTP over a Unix socket (Linux CLI/MCP only)")
     s.add_argument("--cpu", type=float, help="Concurrent CPU scheduling budget (default: 80%% of logical CPUs)")
     s.add_argument("--memory-mb", type=int, help="Job memory budget in MiB (default: 70%% of RAM)")
     s.add_argument("--headroom-mb", type=int, default=512, help="Keep this much measured free memory (default: 512 MiB)")
     s.add_argument("--retention-days", type=float, default=14, help="Forget sessions finished longer ago than this (0 keeps everything; default: 14)")
     i = sub.add_parser("install", help="Install the service, the hooks for existing Claude Code and Codex sessions, and skills")
-    i.add_argument("--no-service", action="store_true", help="Do not install or start the systemd user service")
+    i.add_argument("--no-service", action="store_true", help="Skip the background daemon and automatic startup")
     i.add_argument("--no-hooks", action="store_true", help="Do not install Claude Code and Codex hooks")
     i.add_argument("--no-skills", action="store_true", help="Do not install the arbiter skill")
     sub.add_parser("uninstall", help="Remove what `arbiter install` added (keeps state and config)")
     sub.add_parser("open", help="Open the browser board with a fresh one-time link")
+    sub.add_parser("tray", help="Show the notification-area icon for an existing daemon (Windows)")
     st = sub.add_parser("status", help="Who holds what, until when, and who waits")
     st.add_argument("--json", action="store_true", help="Print the full state as JSON")
     sub.add_parser("whoami", help="Print the Arbiter session of the agent session you run in")
@@ -54,7 +56,7 @@ def parser():
     run.add_argument("--eta", help="Expected duration, e.g. 40m (shown to anyone waiting)")
     run.add_argument("--measure", action="store_true", help="Take the whole machine, wait until it is quiet, print CLEAN or NOISY")
     run.add_argument("--preemptible", action="store_true", help="When another session waits for these resources, create $ARBITER_YIELD_FILE")
-    run.add_argument("--yield-signal", action="store_true", help="With --preemptible, also send SIGTERM to the command")
+    run.add_argument("--yield-signal", action="store_true", help="With --preemptible, also signal the command to stop")
     run.add_argument("--requeue", action="store_true", help="With --preemptible, exit code 75 hands over, then reruns the command")
 
     run.add_argument("--record", action="store_true", help="Privately save this command for a manual rerun")
@@ -184,6 +186,10 @@ def split_command(argv):
 
 
 def main(argv=None):
+    if os.name == "nt":
+        for stream in (sys.stdin, sys.stdout, sys.stderr):
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8")
     argv = sys.argv[1:] if argv is None else argv
     command_argv = []
     if argv and argv[0] == "run":
@@ -204,6 +210,11 @@ def dispatch(args, command_argv):
     if command == "serve":
         from .server import serve
         return serve(args)
+    if command == "tray":
+        if os.name != "nt":
+            raise ValueError("The Arbiter tray is available on Windows")
+        from .tray import Tray
+        return Tray().run()
     if command == "hook":
         from .hook import main as hook
         return hook(args.provider)
@@ -233,7 +244,7 @@ def dispatch(args, command_argv):
     client = Client()
     if command == "open":
         import webbrowser
-        link = client.request("/api/launch", {})["url"]
+        link = client.board_link()
         print(link)
         webbrowser.open(link)
         return

@@ -108,7 +108,11 @@ def open_transcript(provider, conversation_id):
     for path in transcript_paths(provider, conversation_id):
         try:
             # Open only regular provider logs. Avoid following a symlink or blocking on a FIFO.
-            file = os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb")
+            if os.name == "nt":
+                from .win32 import open_shared_file
+                file = open_shared_file(path)
+            else:
+                file = os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb")
         except OSError:
             continue
         with file:

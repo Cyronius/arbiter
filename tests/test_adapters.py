@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from arbiter.adapters import Claude, Codex, Transport, ROUTINE_TOOLS
-from arbiter.workers import group_alive
+from arbiter.system import group_alive
 
 
 class FakeTransport:
@@ -94,7 +94,8 @@ class AdapterTests(unittest.TestCase):
             self.assertIn('stream-json',c.t.argv)
             self.assertNotIn('--dangerously-skip-permissions',c.t.argv)
             self.assertNotIn(self.env['ARBITER_TOKEN'],' '.join(c.t.argv))
-            self.assertEqual(c.config_path.stat().st_mode & 0o777,0o600)
+            if os.name != "nt":
+                self.assertEqual(c.config_path.stat().st_mode & 0o777,0o600)
             self.assertEqual(c.t.sent[0]['request']['subtype'],'initialize')
             c.handle({'type':'control_response','response':{'subtype':'success','request_id':'arbiter-initialize','response':{}}},lambda _:None,lambda *_:None)
             self.assertEqual(c.t.sent[1]['message']['content'],'inspect project')
@@ -114,7 +115,7 @@ class AdapterTests(unittest.TestCase):
 
 class RealProcessTests(unittest.TestCase):
     def test_transport_round_trip_over_real_process_pipes(self):
-        t=Transport([sys.executable,'-u','-c','import sys,json; print(json.dumps(json.loads(sys.stdin.readline())),flush=True)'], '/tmp',os.environ.copy())
+        t=Transport([sys.executable,'-u','-c','import sys,json; print(json.dumps(json.loads(sys.stdin.readline())),flush=True)'], os.getcwd(),os.environ.copy())
         t.send({'id':1,'method':'hello'})
         self.assertEqual(t.incoming.get(timeout=3),{'id':1,'method':'hello'})
         self.assertEqual(t.incoming.get(timeout=3),None)

@@ -64,9 +64,14 @@ class TranscriptTests(unittest.TestCase):
         original = self.write("outside.jsonl", [codex_row("assistant", "hidden")])
         project = self.root / "projects" / "project"
         project.mkdir(parents=True)
-        (project / f"{CONVERSATION}.jsonl").symlink_to(original)
-        self.assertIsNone(conversation("claude", CONVERSATION))
         self.assertIsNone(conversation("claude", "../../outside"))
+        try:
+            (project / f"{CONVERSATION}.jsonl").symlink_to(original)
+        except OSError as exc:
+            if getattr(exc, "winerror", None) != 1314:
+                raise
+            self.skipTest("Windows symlink creation requires Developer Mode or permission")
+        self.assertIsNone(conversation("claude", CONVERSATION))
         self.assertIsNone(sample_context("claude", CONVERSATION))
 
     def test_codex_context_uses_latest_request_and_accepts_smaller_counts(self):

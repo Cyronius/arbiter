@@ -10,6 +10,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from .approvals import confirmation_response
+from .launch import WINDOWS, isolated_options, signal_group, tracked_popen
 
 PENDING = {"pending", "delivered"}
 PROMPT = """You are Arbiter's scheduling operator. Select at most one candidate below.
@@ -110,8 +111,11 @@ def ask_model(policy, choices, stopping):
     with TemporaryDirectory(prefix="arbiter-operator-") as directory:
         argv, output = model_command(policy, directory)
         env = {key: value for key, value in os.environ.items() if not key.startswith("ARBITER_")}
-        with subprocess.Popen(argv, cwd=directory, env=env, start_new_session=True, text=True,
-                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
+        options = dict(cwd=directory, env=env, encoding="utf-8",
+                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        launch = (tracked_popen(argv, lambda _: None, **options) if WINDOWS else
+                  subprocess.Popen(argv, **isolated_options(), **options))
+        with launch as process:
             prompt = PROMPT
             if policy.get("instructions"):
                 prompt += ("Operator preferences for choosing among the eligible actions:\n"
@@ -128,7 +132,7 @@ def ask_model(policy, choices, stopping):
                     if process.returncode:
                         raise ValueError(f"model command exited with status {process.returncode}")
                     if output is not None:
-                        with output.open() as response:
+                        with output.open(encoding="utf-8") as response:
                             result = response.read(4097)
                     if len(result) > 4096:
                         raise ValueError("model decision exceeded 4096 characters")
@@ -138,7 +142,7 @@ def ask_model(policy, choices, stopping):
             finally:
                 if process.poll() is None:
                     try:
-                        os.killpg(process.pid, signal.SIGKILL)
+                        signal_group(process, signal.SIGTERM, force=True)
                     except ProcessLookupError:
                         pass
 

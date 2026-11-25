@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 from . import transcripts
+from .launch import isolated_options
 
 DELAYS = (30, 120)
 OPTIONS = ("preemptible", "yield_signal", "requeue", "measure")
@@ -65,9 +66,9 @@ def dispatch(store, url, children):
         except ValueError as exc:
             store.apply("retry_blocked", {"session": sid, "reason": str(exc)})
     for sid in pending:
-        proc = subprocess.Popen([sys.executable, "-I", str(Path(__file__).with_name("recovery_worker.py").resolve())],
+        proc = subprocess.Popen([sys.executable, "-X", "utf8", "-I", str(Path(__file__).with_name("recovery_worker.py").resolve())],
                                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                start_new_session=True)
+                                **isolated_options(background=True))
         children.append(proc)
         with proc.stdin:
             ticket = store.apply("dispatch", {"session": sid, "pid": proc.pid})

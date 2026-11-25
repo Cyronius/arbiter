@@ -1,5 +1,6 @@
 """Durable recovery decisions and process identity across restart."""
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -50,7 +51,8 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(len(self.store.state["reservations"]), 1)
         self.assertEqual(self.store.launch_record(self.store.session(child))["argv"][1:], ["", "private argument"])
         self.assertNotIn("private argument", json.dumps(self.store.snapshot()) + json.dumps(self.store.events()))
-        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+        if os.name != "nt":
+            self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
 
     def test_empty_bundle_recovery_obeys_interactivity_and_measurement(self):
         sid = self.job(launch={"argv": ["true"], "bundle": {}})
@@ -189,7 +191,7 @@ from arbiter.launch import tracked_popen
 def wait(pid):
     Path(sys.argv[2]).write_text(str(pid))
     time.sleep(30)
-tracked_popen(['touch', sys.argv[1]], wait)
+tracked_popen([sys.executable, '-c', 'from pathlib import Path; import sys; Path(sys.argv[1]).touch()', sys.argv[1]], wait)
 """
         with subprocess.Popen([sys.executable, "-c", code, str(marker), str(ready)]) as supervisor:
             try:
@@ -206,5 +208,6 @@ tracked_popen(['touch', sys.argv[1]], wait)
             time.sleep(.01)
         self.assertFalse(system.alive(child))
         self.assertFalse(marker.exists())
-        self.assertEqual(tracked_popen(["touch", str(marker)], lambda _: None).wait(), 0)
+        argv = [sys.executable, "-c", "from pathlib import Path; import sys; Path(sys.argv[1]).touch()", str(marker)]
+        self.assertEqual(tracked_popen(argv, lambda _: None).wait(), 0)
         self.assertTrue(marker.exists())

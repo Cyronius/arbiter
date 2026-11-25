@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 import shlex
+from .system import WINDOWS
 
 # First words of commands that only read or inspect, and never need a turn.
 READ_ONLY = {
@@ -18,6 +19,11 @@ READ_ONLY_GIT = {"status", "log", "diff", "show", "branch", "remote", "rev-parse
                  "grep", "tag", "stash", "config", "add", "restore", "checkout", "switch", "commit", "fetch", "worktree"}
 WRAPPERS = {"sudo", "nice", "ionice", "time", "nohup", "env", "timeout", "stdbuf", "exec", "command"}
 SEPARATORS = re.compile(r"\|\||&&|[;|&\n]")
+if WINDOWS:
+    READ_ONLY.update({"get-childitem", "get-content", "get-location", "get-command", "get-item", "get-itemproperty",
+                      "get-process", "select-object", "where-object", "select-string", "test-path", "resolve-path",
+                      "write-output", "write-host", "set-location", "format-table", "format-list", "dir", "gci",
+                      "gc", "gi", "gl", "gcm", "sls", "where", "findstr", "tasklist"})
 
 
 def segments(command: str) -> list[list[str]]:
@@ -28,7 +34,13 @@ def segments(command: str) -> list[list[str]]:
         if not part:
             continue
         try:
-            words = shlex.split(part, comments=True)
+            if WINDOWS:
+                lexer = shlex.shlex(part, posix=True)
+                lexer.whitespace_split = True
+                lexer.escape = ""
+                words = list(lexer)
+            else:
+                words = shlex.split(part, comments=True)
         except ValueError:
             words = part.split()
         # Drop leading VAR=value assignments and transparent wrappers with their options.
@@ -43,9 +55,17 @@ def segments(command: str) -> list[list[str]]:
     return out
 
 
+def command_name(word):
+    if WINDOWS:
+        word = word.replace("\\", "/").lower()
+        if word.endswith((".exe", ".cmd", ".bat", ".ps1")):
+            word = word.rsplit(".", 1)[0]
+    return word.rsplit("/", 1)[-1]
+
+
 def self_gated(words: list[str]) -> bool:
     """`arbiter run/hold/wait ...` waits for its own turn; the guard must not hold it too."""
-    return bool(words) and words[0].rsplit("/", 1)[-1] in {"arbiter", "dibs"}
+    return bool(words) and command_name(words[0]) in {"arbiter", "dibs"}
 
 
 def read_only(command: str, extra: frozenset | set = frozenset()) -> bool:
@@ -53,7 +73,7 @@ def read_only(command: str, extra: frozenset | set = frozenset()) -> bool:
     if not segs:
         return True
     for words in segs:
-        name = words[0].rsplit("/", 1)[-1]
+        name = command_name(words[0])
         if name in READ_ONLY or name in extra:
             continue
         if name == "git" and len(words) > 1 and next((w for w in words[1:] if not w.startswith("-")), "") in READ_ONLY_GIT:
@@ -65,7 +85,7 @@ def read_only(command: str, extra: frozenset | set = frozenset()) -> bool:
 def wrapped(command: str) -> bool:
     """True when every resource-using part of the command goes through arbiter itself."""
     segs = segments(command)
-    return bool(segs) and all(self_gated(w) or w[0].rsplit("/", 1)[-1] in READ_ONLY for w in segs)
+    return bool(segs) and all(self_gated(w) or command_name(w[0]) in READ_ONLY for w in segs)
 
 
 def matched(command: str, patterns: dict) -> list[str]:
